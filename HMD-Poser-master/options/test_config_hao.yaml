@@ -1,0 +1,54 @@
+task: "HMD_IMU_Human_Motion_Estimation"
+
+model_name: "HMD_imu_HME_Universe"
+dataset_path: "/home/wh0146/HMD-Poser-master/data_over_2ear_my/"
+#dataset_path: "/home/4T-2/whl/datas/data_46_shape/"
+support_dir: "./body_models/"
+resume_model: "/home/wh0146/HMD-Poser-master/experiments/HMD_IMU_Human_Motion_Estimation/2025-01-10-15-55-32/epoch_with_best_testloss.pt"
+manual_seed: null
+compatible_inputs: ['HMD', 'HMD_2IMUs', 'HMD_3IMUs']
+sparse_dim: 54
+input_motion_length: 40
+train_dataset_repeat_times: 10
+
+model_params:
+  number_layer: 3
+  hidden_size: 256
+  dropout: 0.05
+  nhead: 8
+  block_num: 2
+
+train_config:
+  epochs: 400
+  val_interval: 10
+  num_workers: 4
+  batch_size: 64 # 这里原先是512
+  log_interval: 5
+
+optimizer_config:
+  optimizer: "adam"
+  momentum: 0.9
+  beta2: 0.999
+  weight_decay: 0
+  adam_eps: 0.000001
+  amsgrad: false
+
+lr_config:
+  lr: 0.001
+  lr_decay: [300]
+  lr_decay_factor: 0.1
+  lr_decay_epochs: 3
+  lr_warm_up_start_epoch: 0
+  lr_warm_up_epochs: 1
+  lr_warm_up_factor: 0.001
+  lr_warm_restarts: []
+  lr_warm_restart_duration: 0.5
+
+loss:
+  loss_type: 'l1'
+  root_orientation_weight: 1.0
+  local_pose_weight: 5.0
+  global_pose_weight: 1.0
+  joint_position_weight: 1.0
+  smooth_loss_weight: 0.5
+  shape_loss_weight: 0.1

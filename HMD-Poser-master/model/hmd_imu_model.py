@@ -11,32 +11,6 @@ model_wraps = {
     "HMD_imu_HME_Universe": HMD_imu_HME_Universe,
 }
 
-def forward_kinematics_R(R_local: torch.Tensor, parent):
-    r"""
-    :math:`R_global = FK(R_local)`
-
-    Forward kinematics that computes the global rotation of each joint from local rotations. (torch, batch)
-
-    Notes
-    -----
-    A joint's *local* rotation is expressed in its parent's frame.
-
-    A joint's *global* rotation is expressed in the base (root's parent) frame.
-
-    R_local[:, i], parent[i] should be the local rotation and parent joint id of
-    joint i. parent[i] must be smaller than i for any i > 0.
-
-    Args
-    -----
-    :param R_local: Joint local rotation tensor in shape [batch_size, *] that can reshape to
-                    [batch_size, num_joint, 3, 3] (rotation matrices).
-    :param parent: Parent joint id list in shape [num_joint]. Use -1 or None for base id (parent[0]).
-    :return: Joint global rotation, in shape [batch_size, num_joint, 3, 3].
-    """
-    R_local = R_local.view(R_local.shape[0], -1, 3, 3)
-    R_global = _forward_tree(R_local, parent, torch.bmm)
-    return R_global
-
 def _forward_tree(x_local: torch.Tensor, parent, reduction_fn):
     r"""
     Multiply/Add matrices along the tree branches. x_local [N, J, *]. parent [J].
@@ -65,7 +39,10 @@ class HMDIMUModel(nn.Module):
         num_betas = 16 # number of body parameters
         num_dmpls = 8 # number of DMPL parameters
         self.bm = BodyModel(bm_fname=bm_fname, num_betas=num_betas, num_dmpls=num_dmpls, dmpl_fname=dmpl_fname).to(device)
-
+    def forward_kinematics_R(self, R_local: torch.Tensor, parent):
+        R_local = R_local.view(R_local.shape[0], -1, 3, 3)
+        R_global = _forward_tree(R_local, parent, torch.bmm)
+        return R_global
     def fk_module(self, global_orientation, joint_rotation, body_shape):
         global_orientation = utils_transform.sixd2aa(global_orientation.reshape(-1,6)).reshape(global_orientation.shape[0],-1).float()
         joint_rotation = utils_transform.sixd2aa(joint_rotation.reshape(-1,6)).reshape(joint_rotation.shape[0],-1).float()
@@ -119,14 +96,33 @@ class HMDIMUModel(nn.Module):
             'epoch': epoch}, filename)
 
     def forward(self, sparse_input, do_fk=True):
+        """
+        模型的完整前向传播。
+        当 do_fk=False 时，只执行低成本的网络推理，不进行耗费显存的前向动力学计算。
+        """
         batch_size, time_length = sparse_input.shape[0], sparse_input.shape[1]
+
+        # 步骤1: 低成本的网络推理，得到姿态和体型参数
         pred_pose, pred_shapes = self.netG(sparse_input)
-        rotation_local_matrot = utils_transform.sixd2matrot(pred_pose.reshape(-1, 6)).reshape(batch_size*time_length, 22, 3, 3)
-        rotation_global_matrot = forward_kinematics_R(rotation_local_matrot, self.bm.kintree_table[0][:22].long()).view(batch_size, time_length, 22, 3, 3)
-        rotation_global_r6d = utils_transform.matrot2sixd(rotation_global_matrot.reshape(-1, 3, 3)).reshape(batch_size, time_length, 22*6)
+        # --- 核心修改 2: 在 forward 函数内部，使用 self 来调用 ---
+        rotation_local_matrot = utils_transform.sixd2matrot(pred_pose.reshape(-1, 6)).reshape(batch_size * time_length,
+                                                                                              22, 3, 3)
+        rotation_global_matrot = self.forward_kinematics_R(rotation_local_matrot,
+                                                           self.bm.kintree_table[0][:22].long()).view(batch_size,
+                                                                                                      time_length, 22,
+                                                                                                      3, 3)
+
+        rotation_global_r6d = utils_transform.matrot2sixd(rotation_global_matrot.reshape(-1, 3, 3)).reshape(batch_size,
+                                                                                                            time_length,
+                                                                                                            22 * 6)
         if do_fk:
-            pred_joint_position = self.fk_module(pred_pose[:, :, :6].reshape(-1, 6), pred_pose[:, :, 6:].reshape(-1, 21*6), pred_shapes.reshape(-1, 16))
+            pred_joint_position = self.fk_module(
+                pred_pose[:, :, :6].reshape(-1, 6),
+                pred_pose[:, :, 6:].reshape(-1, 21*6),
+                pred_shapes.reshape(-1, 16)
+            )
             pred_joint_position = pred_joint_position.reshape(batch_size, time_length, 22, 3)
             return pred_pose, pred_shapes, rotation_global_r6d, pred_joint_position
         else:
-            return pred_pose, pred_shapes, rotation_global_r6d
+            # 当不做FK时，我们只返回基础的网络输出
+            return pred_pose, pred_shapes

@@ -9,44 +9,27 @@ from torch.nn import functional as F
 class TemporalSpatialBackbone(torch.nn.Module):
     def __init__(self, input_dim, number_layer=3, hidden_size=256, dropout=0.05, nhead=8, block_num=2):
         super().__init__()
-        assert input_dim == 54, "invalid input dim"
-        self.head1_linear_embeddings = nn.ModuleList([nn.Sequential(nn.Linear(6, 128), nn.LeakyReLU()),
-                                    nn.Sequential(nn.Linear(6, 128), nn.LeakyReLU())])
-        # self.head2_linear_embeddings = nn.ModuleList([nn.Sequential(nn.Linear(6, hidden_size//4), nn.LeakyReLU()),
-        #                             nn.Sequential(nn.Linear(6, hidden_size//4), nn.LeakyReLU()),
-        #                             nn.Sequential(nn.Linear(3, hidden_size//4), nn.LeakyReLU()),
-        #                             nn.Sequential(nn.Linear(3, hidden_size//4), nn.LeakyReLU())])
-        # self.rhand_linear_embeddings = nn.ModuleList([nn.Sequential(nn.Linear(6, hidden_size//4), nn.LeakyReLU()),
-        #                             nn.Sequential(nn.Linear(6, hidden_size//4), nn.LeakyReLU()),
-        #                             nn.Sequential(nn.Linear(3, hidden_size//4), nn.LeakyReLU()),
-        #                             nn.Sequential(nn.Linear(3, hidden_size//4), nn.LeakyReLU())])
-        self.lfoot_linear_embeddings = nn.ModuleList([nn.Sequential(nn.Linear(6, 128), nn.LeakyReLU()),
-                                    nn.Sequential(nn.Linear(6, 128), nn.LeakyReLU())])
-        self.rfoot_linear_embeddings = nn.ModuleList([nn.Sequential(nn.Linear(6, 128), nn.LeakyReLU()),
-                                    nn.Sequential(nn.Linear(6, 128), nn.LeakyReLU())])
-        self.pelvis_linear_embeddings = nn.ModuleList([nn.Sequential(nn.Linear(6, 128), nn.LeakyReLU()),
-                                    nn.Sequential(nn.Linear(6, 128), nn.LeakyReLU())])
-        self.ear1_linear_embeddings = nn.ModuleList([nn.Sequential(nn.Linear(3, 256), nn.LeakyReLU())])
-        self.ear2_linear_embeddings = nn.ModuleList([nn.Sequential(nn.Linear(3, 256), nn.LeakyReLU())])
-        # self.lhand_inhead_linear_embeddings = nn.ModuleList([nn.Sequential(nn.Linear(6, hidden_size//4), nn.LeakyReLU()),
-        #                             nn.Sequential(nn.Linear(6, hidden_size//4), nn.LeakyReLU()),
-        #                             nn.Sequential(nn.Linear(3, hidden_size//4), nn.LeakyReLU()),
-        #                             nn.Sequential(nn.Linear(3, hidden_size//4), nn.LeakyReLU())])
-        # self.rhand_inhead_linear_embeddings = nn.ModuleList([nn.Sequential(nn.Linear(6, hidden_size//4), nn.LeakyReLU()),
-        #                             nn.Sequential(nn.Linear(6, hidden_size//4), nn.LeakyReLU()),
-        #                             nn.Sequential(nn.Linear(3, hidden_size//4), nn.LeakyReLU()),
-        #                             nn.Sequential(nn.Linear(3, hidden_size//4), nn.LeakyReLU())])
+        assert input_dim == 18, "Invalid input dim. Expected 18 for AgilePoser."
+        # --- 修改 2: 彻底简化线性嵌入层 ---
+        # 移除所有冗余的、针对不存在传感器的Embedding层（如脚、骨盆等）
+        # 我们只为真正存在的信息源定义清晰的嵌入模块
+        self.head_rot_embedding = nn.Sequential(nn.Linear(6, hidden_size), nn.LeakyReLU())
+        self.head_vel_embedding = nn.Sequential(nn.Linear(6, hidden_size), nn.LeakyReLU())
+        self.ear_acc_embedding = nn.Sequential(nn.Linear(6, hidden_size), nn.LeakyReLU())
 
         norm_layer=partial(nn.LayerNorm, eps=1e-6)
         self.norm = norm_layer(hidden_size)
         
         self.num_block = block_num
         num_rnn_layer = 1
+        # --- 修改 3: 调整时序编码器以匹配新的输入结构 ---
+        # 我们的输入被分为3个部分（头旋转、头速度、耳加速度），所以LSTM列表长度为3
         self.time_encoder = nn.ModuleList(
-            [nn.ModuleList([torch.nn.LSTM(hidden_size, hidden_size, num_rnn_layer, 
-            bidirectional=False, batch_first=True) for _ in range(6)]) for _ in range(self.num_block)]
+            [nn.ModuleList([torch.nn.LSTM(hidden_size, hidden_size, num_rnn_layer,
+                                          bidirectional=False, batch_first=True) for _ in range(3)]) for _ in
+             range(self.num_block)]
         )
-   
+
         encoder_layer = nn.TransformerEncoderLayer(hidden_size, nhead=nhead, batch_first=True)
         self.spatial_encoder = nn.ModuleList(
             [nn.TransformerEncoder(encoder_layer, num_layers=number_layer) for _ in range(self.num_block)]
@@ -65,103 +48,69 @@ class TemporalSpatialBackbone(torch.nn.Module):
     def forward(self, x_in, rnn_state=None):
         # separate the input features
         batch_size, time_seq = x_in.shape[0], x_in.shape[1]
-        head_feats1 = [x_in[..., 0:6], x_in[..., 24:30]]    # 提取特征？？feature embedding 18
-        # head_feats2 = [x_in[..., 6:12], x_in[..., 36:42], x_in[..., 63:66], x_in[..., 69:72]]  # 提取特征？？feature embedding 18
-        # lhand_feats = [x_in[..., 6:12], x_in[..., 42:48], x_in[..., 75:78], x_in[..., 84:87]]
-        # rhand_feats = [x_in[..., 12:18], x_in[..., 48:54], x_in[..., 78:81], x_in[..., 87:90]]
-        lfoot_feats = [x_in[..., 6:12], x_in[..., 30:36]]
-        rfoot_feats = [x_in[..., 12:18], x_in[..., 36:42]]
-        pelvis_feats = [x_in[..., 18:24], x_in[..., 42:48]]
-        ear1_feats = [x_in[..., 48:51]]
-        ear2_feats = [x_in[..., 51:54]]
-        # lhand_inhead_feats = [x_in[..., 90:96], x_in[..., 102:108], x_in[..., 114:117], x_in[..., 120:123]]
-        # rhand_inhead_feats = [x_in[..., 96:102], x_in[..., 108:114], x_in[..., 117:120], x_in[..., 123:126]]
+        # --- 修改 4: 简化特征分解，直接、清晰地处理18维输入 ---
+        # 不再有复杂的、基于54维度的切片
+        head_rot_feat = x_in[..., 0:6]   # [B, T, 6]
+        head_vel_feat = x_in[..., 6:12]  # [B, T, 6]
+        ear_acc_feat  = x_in[..., 12:18] # [B, T, 6]
+        # 分别进行嵌入
+        head_rot_emb = self.norm(self.head_rot_embedding(head_rot_feat))
+        head_vel_emb = self.norm(self.head_vel_embedding(head_vel_feat))
+        ear_acc_emb  = self.norm(self.ear_acc_embedding(ear_acc_feat))
         
-        # MLP embedding
-        head1_emb = []
-        for idx in range(len(head_feats1)):
-            head1_emb.append(self.head1_linear_embeddings[idx](head_feats1[idx]))
-        head1_emb = self.norm(torch.cat(head1_emb, dim=-1))
-        
-        # head2_emb = []
-        # for idx in range(len(head_feats2)):
-        #     head2_emb.append(self.head2_linear_embeddings[idx](head_feats2[idx]))
-        # head2_emb = self.norm(torch.cat(head2_emb, dim=-1))
-        #
-        # rhand_emb = []
-        # for idx in range(len(rhand_feats)):
-        #     rhand_emb.append(self.rhand_linear_embeddings[idx](rhand_feats[idx]))
-        # rhand_emb = self.norm(torch.cat(rhand_emb, dim=-1))
+        # 将嵌入后的特征堆叠，形成一个 [B, T, 3, hidden_size] 的张量
+        collect_feats = torch.stack([head_rot_emb, head_vel_emb, ear_acc_emb], dim=-2)
 
-        lfoot_emb = []
-        for idx in range(len(lfoot_feats)):
-            lfoot_emb.append(self.lfoot_linear_embeddings[idx](lfoot_feats[idx]))
-        lfoot_emb = self.norm(torch.cat(lfoot_emb, dim=-1))
-
-        rfoot_emb = []
-        for idx in range(len(rfoot_feats)):
-            rfoot_emb.append(self.rfoot_linear_embeddings[idx](rfoot_feats[idx]))
-        rfoot_emb = self.norm(torch.cat(rfoot_emb, dim=-1))
-
-        pelvis_emb = []
-        for idx in range(len(pelvis_feats)):
-            pelvis_emb.append(self.pelvis_linear_embeddings[idx](pelvis_feats[idx]))
-        pelvis_emb = self.norm(torch.cat(pelvis_emb, dim=-1))
-
-        ear1_emb = []
-        for idx in range(len(ear1_feats)):
-            ear1_emb.append(self.ear1_linear_embeddings[idx](ear1_feats[idx]))
-        ear1_emb = self.norm(torch.cat(ear1_emb, dim=-1))
-
-        ear2_emb = []
-        for idx in range(len(ear2_feats)):
-            ear2_emb.append(self.ear2_linear_embeddings[idx](ear2_feats[idx]))
-        ear2_emb = self.norm(torch.cat(ear2_emb, dim=-1))
-
-        # lhand_inhead_emb = []
-        # for idx in range(len(lhand_inhead_feats)):
-        #     lhand_inhead_emb.append(self.lhand_inhead_linear_embeddings[idx](lhand_inhead_feats[idx]))
-        # lhand_inhead_emb = self.norm(torch.cat(lhand_inhead_emb, dim=-1))
-        #
-        # rhand_inhead_emb = []
-        # for idx in range(len(rhand_inhead_feats)):
-        #     rhand_inhead_emb.append(self.rhand_inhead_linear_embeddings[idx](rhand_inhead_feats[idx]))
-        # rhand_inhead_emb = self.norm(torch.cat(rhand_inhead_emb, dim=-1))
-
-        collect_feats = torch.stack([head1_emb, lfoot_emb, rfoot_emb, pelvis_emb,ear1_emb,ear2_emb], dim=-2).reshape(batch_size, time_seq, 6, -1)    # （768,40,8,256）！！！！ 8个部分
-        
+        # --- 修改 5: 调整时空编码器的循环范围以匹配新的结构 ---
         # temporal and spatial backbone
         for idx in range(self.num_block):
             collect_feats_temporal = []
-            for idx_num in range(6):
-                collect_feats_temporal.append(self.time_encoder[idx][idx_num](collect_feats[:, :, idx_num, :], None)[0])  # 第0,1块idx的模块中的，第0~7个种类数据从里面选择执行
+            # 循环范围从6改为3
+            for idx_num in range(3):
+                # 对每个部位的特征独立进行时序编码
+                part_features = collect_feats[:, :, idx_num, :]
+                temporal_out, _ = self.time_encoder[idx][idx_num](part_features, None)
+                collect_feats_temporal.append(temporal_out)
+
             collect_feats_temporal = torch.stack(collect_feats_temporal, dim=-2)
-            collect_feats = self.spatial_encoder[idx](collect_feats_temporal.reshape(batch_size*time_seq, 6, -1)).reshape(batch_size, time_seq, 6, -1)
+
+            # 空间编码器现在融合3个部位的信息
+            # Reshape for Transformer: [B*T, 3, hidden_size]
+            reshaped_for_spatial = collect_feats_temporal.reshape(batch_size * time_seq, 3, -1)
+            spatial_out = self.spatial_encoder[idx](reshaped_for_spatial)
+
+            # Reshape back to [B, T, 3, hidden_size]
+            collect_feats = spatial_out.reshape(batch_size, time_seq, 3, -1)
+
         return collect_feats
 
 class HMD_imu_HME_Universe(torch.nn.Module):
     def __init__(self, input_dim, number_layer=3, hidden_size=256, dropout=0.05, nhead=8, block_num=2):
         super().__init__()
-        assert input_dim == 54, "invalid input dim"
+        assert input_dim == 18, "invalid input dim"
+        # 实例化我们修改好的Backbone
         self.backbone = TemporalSpatialBackbone(input_dim, number_layer, hidden_size, dropout, nhead, block_num)
 
+        # 解码器的输入维度现在由backbone的输出决定
+        # 我们的backbone输出是 [B, T, 3, hidden_size]，所以展平后是 hidden_size*3
         self.pose_est = nn.Sequential(
-                                nn.Linear(hidden_size*6, 256),
+                                nn.Linear(hidden_size * 3, 256),
                                 nn.LeakyReLU(),
                                 nn.Linear(256, 22 * 6)
             )
 
         self.shape_est = nn.Sequential(
-                            nn.Linear(hidden_size*6, 256),
+                            nn.Linear(hidden_size * 3, 256),
                             nn.LeakyReLU(),
                             nn.Linear(256, 16)
             )
-        
-    
+
     def forward(self, x_in, rnn_state=None):
-        collect_feats = self.backbone(x_in, rnn_state)  # 时空特征学习
+        collect_feats = self.backbone(x_in, rnn_state)
         batch_size, time_seq = x_in.shape[0], x_in.shape[1]
-        collect_feats = collect_feats.reshape(batch_size, time_seq, -1) #时空特征聚合
+
+        # 将 [B, T, 3, hidden_size] 的输出展平为 [B, T, 3 * hidden_size]
+        collect_feats = collect_feats.reshape(batch_size, time_seq, -1)
 
         pred_pose = self.pose_est(collect_feats)
         pred_shapes = self.shape_est(collect_feats)

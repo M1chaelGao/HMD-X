@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 from model.hmd_imu_model import HMDIMUModel
 from model.loss import PoseJointLoss
 from runner.training_loop import train_loop
-
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str,  help="Path, where config file is stored")
@@ -24,8 +24,8 @@ def main():
     out_dir, LOG, train_summary_writer = add_log(configs)
     dst_file = os.path.join(out_dir, os.path.basename(args.config))
     os.system('cp {} {}'.format(args.config, dst_file))
-    
-    device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     '''
     # ----------------------------------------
     # seed

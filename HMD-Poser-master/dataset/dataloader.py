@@ -1,17 +1,11 @@
-import ast
 import glob
 import os
 
 import torch
 from torch.utils.data import Dataset
 
+
 def get_path(dataset_path, split):
-    # if split == "test":
-    #     filenames_test = os.path.join(dataset_path, '*/test/*.pt')
-    #     # 读取文件并解析成 Python 列表
-    #     with open("/home/wh0146/AGRoL-main/AGRoL-main/111.txt", "r") as f:
-    #         data_list_path = ast.literal_eval(f.read())  # 解析成列表
-    #     return data_list_path
     data_list_path = []
     parent_data_path = glob.glob(dataset_path + "/*")
     for d in parent_data_path:
@@ -22,24 +16,25 @@ def get_path(dataset_path, split):
                     data_list_path.extend(files)
     return data_list_path
 
+
 def load_data(dataset_path, split, **kwargs):
     motion_list = get_path(dataset_path, split)
     input_motion_length = kwargs["input_motion_length"]
     motion_raw_data = []
     for data_i in motion_list:
         motion_raw_data.extend(torch.load(data_i))
-    
+
     valid_motion_data = []
-    tmp_data_list = []
     for data in motion_raw_data:
         if split == "train" and data["rotation_local_full_gt_list"].shape[0] < input_motion_length:
             continue
+        # 这里的数据已经是我们需要的18维数据了
         input_feat = data["hmd_position_global_full_gt_list"]
         gt_local_pose = data["rotation_local_full_gt_list"]
         gt_global_pose = data["rotation_global_full_gt_list"]
         gt_positions = data["position_global_full_gt_world"]
         gt_betas = data["body_parms_list"]['betas'][1:]
-        tmp_data_list.append(gt_local_pose)
+
         valid_motion_data.append({
             'input_feat': input_feat,
             'gt_local_pose': gt_local_pose,
@@ -48,16 +43,16 @@ def load_data(dataset_path, split, **kwargs):
             'gt_betas': gt_betas
         })
     return valid_motion_data
-    
+
+
 class TrainDataset(Dataset):
     def __init__(
-        self,
-        train_datas,
-        compatible_inputs=['HMD', 'HMD_2IMUs', 'HMD_3IMUs'],
-        input_motion_length=40,
-        train_dataset_repeat_times=1,
+            self,
+            train_datas,
+            compatible_inputs,  # 这个参数虽然保留，但在新逻辑中不再使用
+            input_motion_length=40,
+            train_dataset_repeat_times=1,
     ):
-        self.compatible_inputs = compatible_inputs
         self.train_dataset_repeat_times = train_dataset_repeat_times
         self.input_motion_length = input_motion_length
         self.motions = train_datas
@@ -70,45 +65,36 @@ class TrainDataset(Dataset):
         seqlen = motion_data['input_feat'].shape[0]
 
         if seqlen <= self.input_motion_length:
-            idx = 0
+            start_idx = 0
         else:
-            idx = torch.randint(0, int(seqlen - self.input_motion_length), (1,))[0]
-        
-        gt_local_pose = motion_data['gt_local_pose'][idx : idx + self.input_motion_length]
-        gt_global_pose = motion_data['gt_global_pose'][idx : idx + self.input_motion_length]
-        gt_positions = motion_data['gt_positions'][idx : idx + self.input_motion_length]
-        gt_betas = motion_data['gt_betas'][idx : idx + self.input_motion_length]
-        
-        input_feat_all = []
-        if 'HMD_3IMUs' in self.compatible_inputs:
-            input_feat = motion_data['input_feat'][idx : idx + self.input_motion_length].clone()
-            input_feat_all.append(input_feat)
-        if 'HMD_2IMUs' in self.compatible_inputs:
-            input_feat = motion_data['input_feat'][idx : idx + self.input_motion_length].clone()
-            input_feat[:, list(range(18, 24)) + list(range(42, 48))] = 0  # 去根，补0
-            input_feat_all.append(input_feat)
-        if 'HMD' in self.compatible_inputs:
-            input_feat = motion_data['input_feat'][idx : idx + self.input_motion_length].clone()
-            input_feat[:, list(range(6, 24)) + list(range(30, 48))] = 0  # 去根和双小腿，补0
-            input_feat_all.append(input_feat)
-        
-        input_feat_res = torch.stack(input_feat_all, dim=0)
-        gt_local_pose = gt_local_pose.unsqueeze(0).repeat(input_feat_res.shape[0], 1, 1)
-        gt_global_pose = gt_global_pose.unsqueeze(0).repeat(input_feat_res.shape[0], 1, 1)
-        gt_positions = gt_positions.unsqueeze(0).repeat(input_feat_res.shape[0], 1, 1, 1)
-        gt_betas = gt_betas.unsqueeze(0).repeat(input_feat_res.shape[0], 1, 1)
-        return input_feat_res, gt_local_pose, gt_global_pose, gt_positions, gt_betas
+            start_idx = torch.randint(0, int(seqlen - self.input_motion_length), (1,))[0]
+
+        end_idx = start_idx + self.input_motion_length
+
+        # --- 核心修改：直接切片，不再有任何置零或堆叠操作 ---
+        input_feat = motion_data['input_feat'][start_idx: end_idx]
+        gt_local_pose = motion_data['gt_local_pose'][start_idx: end_idx]
+        gt_global_pose = motion_data['gt_global_pose'][start_idx: end_idx]
+        gt_positions = motion_data['gt_positions'][start_idx: end_idx]
+        gt_betas = motion_data['gt_betas'][start_idx: end_idx]
+
+        # --- 新增：在这里加入我们为MSGN生成的状态伪标签 ---
+        # (这部分逻辑我们在第一周冲刺计划中添加)
+        # motion_state_labels = self.calculate_motion_state(gt_positions)
+
+        # 直接返回张量，不再需要为HMD, HMD_2IMUs等模式进行堆叠
+        # return input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas, motion_state_labels
+        return input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas
+
 
 class TestDataset(Dataset):
     def __init__(
-        self,
-        train_datas,
-        compatible_inputs=['HMD', 'HMD_2IMUs', 'HMD_3IMUs'],
-        input_motion_length=40,
-        train_dataset_repeat_times=1,
+            self,
+            train_datas,
+            compatible_inputs,  # 这个参数虽然保留，但在新逻辑中不再使用
+            input_motion_length=40,
+            train_dataset_repeat_times=1,
     ):
-        self.compatible_inputs = compatible_inputs
-        self.train_dataset_repeat_times = train_dataset_repeat_times
         self.input_motion_length = input_motion_length
         self.motions = train_datas
 
@@ -116,34 +102,16 @@ class TestDataset(Dataset):
         return len(self.motions)
 
     def __getitem__(self, idx):
-        motion_data = self.motions[idx % len(self.motions)]
+        motion_data = self.motions[idx]
 
+        # --- 核心修改：直接返回完整的序列，移除所有模拟输入的逻辑 ---
         input_feat = motion_data['input_feat']
         gt_local_pose = motion_data['gt_local_pose']
         gt_global_pose = motion_data['gt_global_pose']
         gt_positions = motion_data['gt_positions']
         gt_betas = motion_data['gt_betas']
-        assert input_feat.shape[0] == gt_local_pose.shape[0] and \
-            gt_local_pose.shape[0] == gt_global_pose.shape[0] and \
-            gt_global_pose.shape[0] == gt_positions.shape[0] and \
-            gt_positions.shape[0] == gt_betas.shape[0]
-        
-        input_feat_all = []
-        if 'HMD_3IMUs' in self.compatible_inputs:
-            input_feat = motion_data['input_feat'].clone()
-            input_feat_all.append(input_feat)
-        if 'HMD_2IMUs' in self.compatible_inputs:
-            input_feat = motion_data['input_feat'].clone()
-            input_feat[:, list(range(18, 24)) + list(range(42, 48))] = 0
-            input_feat_all.append(input_feat)
-        if 'HMD' in self.compatible_inputs:
-            input_feat = motion_data['input_feat'].clone()
-            input_feat[:, list(range(6, 24)) + list(range(30, 48))] = 0
-            input_feat_all.append(input_feat)
-            
-        input_feat_res = torch.stack(input_feat_all, dim=0)
-        gt_local_pose = gt_local_pose.unsqueeze(0).repeat(input_feat_res.shape[0], 1, 1)
-        gt_global_pose = gt_global_pose.unsqueeze(0).repeat(input_feat_res.shape[0], 1, 1)
-        gt_positions = gt_positions.unsqueeze(0).repeat(input_feat_res.shape[0], 1, 1, 1)
-        gt_betas = gt_betas.unsqueeze(0).repeat(input_feat_res.shape[0], 1, 1)
-        return input_feat_res, gt_local_pose, gt_global_pose, gt_positions, gt_betas
+
+        # 同样，后续可以在这里加入为整个测试序列生成的状态伪标签
+
+        # 直接返回，不再有stack操作
+        return input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas

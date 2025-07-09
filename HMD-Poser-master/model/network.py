@@ -93,26 +93,56 @@ class HMD_imu_HME_Universe(torch.nn.Module):
 
         # 解码器的输入维度现在由backbone的输出决定
         # 我们的backbone输出是 [B, T, 3, hidden_size]，所以展平后是 hidden_size*3
-        self.pose_est = nn.Sequential(
+        self.pose_est_head = nn.Sequential(
                                 nn.Linear(hidden_size * 3, 256),
                                 nn.LeakyReLU(),
                                 nn.Linear(256, 22 * 6)
             )
 
-        self.shape_est = nn.Sequential(
+        self.shape_est_head = nn.Sequential(
                             nn.Linear(hidden_size * 3, 256),
                             nn.LeakyReLU(),
                             nn.Linear(256, 16)
             )
 
     def forward(self, x_in, rnn_state=None):
-        collect_feats = self.backbone(x_in, rnn_state)
+        # Backbone輸出原始特徵和姿態草稿
+        aggregated_features = self.backbone(x_in, rnn_state)
         batch_size, time_seq = x_in.shape[0], x_in.shape[1]
 
-        # 将 [B, T, 3, hidden_size] 的输出展平为 [B, T, 3 * hidden_size]
-        collect_feats = collect_feats.reshape(batch_size, time_seq, -1)
+        features_flat = aggregated_features.reshape(batch_size, time_seq, -1)
 
-        pred_pose = self.pose_est(collect_feats)
-        pred_shapes = self.shape_est(collect_feats)
+        pose_draft = self.pose_est_head(features_flat)
+        pred_shapes = self.shape_est_head(features_flat)
 
-        return pred_pose, pred_shapes
+        # 返回特徵和草稿，供HMDIMUModel進行後續修正
+        return pose_draft, pred_shapes, aggregated_features
+
+
+# --- 新增：一個更強大的、帶有上下文感知的修正網路 ---
+class ContextualRefiner(nn.Module):
+    """
+    一個基於MLP的修正網路，它接收部位的姿態草稿和對應的原始特徵，來預測殘差。
+    """
+
+    def __init__(self, pose_part_dim, feature_dim, hidden_dim=256):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(pose_part_dim + feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, pose_part_dim)
+        )
+
+    def forward(self, pose_part_flat, feature_part_flat):
+        """
+        Args:
+            pose_part_flat (torch.Tensor): 該部位的姿態草稿。
+            feature_part_flat (torch.Tensor): 主幹網絡輸出的、對應的原始特徵。
+
+        Returns:
+            torch.Tensor: 預測出的殘差。
+        """
+        combined_input = torch.cat([pose_part_flat, feature_part_flat], dim=-1)
+        return self.network(combined_input)

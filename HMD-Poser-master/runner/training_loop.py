@@ -10,7 +10,7 @@ RADIANS_TO_DEGREES = 360.0 / (2 * math.pi)
 METERS_TO_CENTIMETERS = 100.0
 
 def train_loop(configs, device, model, loss_func, optimizer, \
-        lr_scheduler, train_loader, test_loader, LOG, train_summary_writer, out_dir):
+               lr_scheduler, train_loader, test_loader, LOG, train_summary_writer, out_dir, total_loss_main=None):
     global_step = 0
     best_train_loss, best_test_loss, best_position, best_local_pose = float("inf"), float("inf"), float("inf"), float("inf")
     for epoch in range(configs.train_config.epochs):
@@ -34,14 +34,28 @@ def train_loop(configs, device, model, loss_func, optimizer, \
                 gt_positions = torch.flatten(gt_positions, start_dim=0, end_dim=1)
                 gt_betas = torch.flatten(gt_betas, start_dim=0, end_dim=1)
 
-            pred_local_pose, pred_betas, rotation_global_r6d, pred_joint_position = model(input_feat) #！！！！！！
+            refined_pose, pose_draft, pred_shapes, rotation_global_r6d, pred_joint_position = model(input_feat)
+            pred_local_pose = refined_pose
+            pred_betas = pred_shapes
             pred_joint_position_head_centered = pred_joint_position - pred_joint_position[:, :, 15:16] + gt_positions[:, :, 15:16]  # 把输入的头部位置作为最终的
             gt_positions_head_centered = gt_positions
-            root_orientation_loss, local_pose_loss, global_pose_loss, joint_position_loss, accel_loss, shape_loss, total_loss = \
+
+            root_orientation_loss, local_pose_loss, global_pose_loss, joint_position_loss, accel_loss, shape_loss, total_loss_main = \
                 loss_func(pred_local_pose[:, :, :6], pred_local_pose[:, :, 6:], rotation_global_r6d, pred_joint_position_head_centered, pred_betas, \
-                    gt_local_pose[:, :, :6], gt_local_pose[:, :, 6:], gt_global_pose, gt_positions_head_centered, gt_betas)
+                          gt_local_pose[:, :, :6], gt_local_pose[:, :, 6:], gt_global_pose, gt_positions_head_centered, gt_betas)
+            # 2. 计算辅助损失 (针对原始草稿的L1损失)
+            #    注意：这里的gt_local_pose是和pose_draft维度完全匹配的真值
+            loss_draft = torch.nn.functional.l1_loss(pose_draft, gt_local_pose)
+            # 3. 合并成最终的总损失
+            alpha = 0.3  # 这是一个超参数，您可以根据实验效果调整
+            total_loss = total_loss_main + alpha * loss_draft
+            # --- 修改结束 ---
             # loss是l1损失
             total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                (p for p in model.parameters() if p.requires_grad),
+                max_norm=1.0
+            )
             optimizer.step()
             lr_scheduler.step()
             lr = optimizer.param_groups[0]['lr']
@@ -67,7 +81,8 @@ def train_loop(configs, device, model, loss_func, optimizer, \
                     'global_pose_loss': round(float(global_pose_loss.item()), 3),
                     'joint_3d_loss': round(float(joint_position_loss.item()), 3),
                     'smooth_loss': round(float(accel_loss.item()), 3),
-                    'shape_loss': round(float(shape_loss.item()), 3)
+                    'shape_loss': round(float(shape_loss.item()), 3),
+                    'loss_draft': round(float(loss_draft.item()), 3)
                 }
                 LOG.info(batch_info)
         one_epoch_root_loss = torch.tensor(one_epoch_root_loss).mean().item()
@@ -141,7 +156,7 @@ def train_loop(configs, device, model, loss_func, optimizer, \
                     chunk_size = configs.input_motion_length
 
                     if full_seq_len <= chunk_size:
-                        pred_local_pose, pred_betas = model(input_feat, do_fk=False)
+                        pred_local_pose, _, pred_betas = model(input_feat, do_fk=False)
                     else:
                         stride = chunk_size // 2
                         pred_pose_chunks = []
@@ -156,7 +171,7 @@ def train_loop(configs, device, model, loss_func, optimizer, \
                                 start_idx = end_idx - chunk_size
 
                             input_chunk = input_feat[:, start_idx:end_idx]
-                            pred_pose_chunk, pred_betas_chunk = model(input_chunk, do_fk=False)
+                            pred_pose_chunk, _, pred_betas_chunk = model(input_chunk, do_fk=False)
                             pred_pose_chunks.append(pred_pose_chunk)
                             pred_betas_chunks.append(pred_betas_chunk)
 
@@ -189,8 +204,9 @@ def train_loop(configs, device, model, loss_func, optimizer, \
                                 break
 
                         # 使用各自的计数器进行平均
-                        pred_local_pose /= pose_count_matrix
-                        pred_betas /= betas_count_matrix
+                        epsilon = 1e-8
+                        pred_local_pose /= (pose_count_matrix + epsilon)
+                        pred_betas /= (betas_count_matrix + epsilon)
                     # ------------------- 滑动窗口结束，后续计算不变 -------------------
 
                     # 在得到完整的、与GT对齐的预测序列后，再统一进行FK计算和误差评估
@@ -212,7 +228,7 @@ def train_loop(configs, device, model, loss_func, optimizer, \
                                                                               15:16] + gt_positions[:, :, 15:16]
                     gt_positions_head_centered = gt_positions
 
-                    root_orientation_loss, local_pose_loss, global_pose_loss, joint_position_loss, accel_loss, shape_loss, total_loss = \
+                    root_orientation_loss, local_pose_loss, global_pose_loss, joint_position_loss, accel_loss, shape_loss, total_loss_main = \
                         loss_func(pred_local_pose[:, :, :6], pred_local_pose[:, :, 6:], rotation_global_r6d,
                                   pred_joint_position_head_centered, pred_betas, \
                                   gt_local_pose[:, :, :6], gt_local_pose[:, :, 6:], gt_global_pose,
@@ -230,7 +246,7 @@ def train_loop(configs, device, model, loss_func, optimizer, \
                     diff[diff < -np.pi] += 2 * np.pi
                     rot_error = torch.mean(torch.absolute(diff))
 
-                    val_metrics['total_loss'].append(total_loss.item())
+                    val_metrics['total_loss'].append(total_loss_main.item())
                     val_metrics['root_loss'].append(root_orientation_loss.item())
                     val_metrics['lpose_loss'].append(local_pose_loss.item())
                     val_metrics['gpose_loss'].append(global_pose_loss.item())

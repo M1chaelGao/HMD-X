@@ -6,6 +6,7 @@ from utils import utils_transform
 from human_body_prior.body_model.body_model import BodyModel
 import os
 from torch.nn.parallel import DataParallel, DistributedDataParallel
+from .network import  ContextualRefiner
 
 model_wraps = {
     "HMD_imu_HME_Universe": HMD_imu_HME_Universe,
@@ -32,6 +33,7 @@ class HMDIMUModel(nn.Module):
             configs.model_params.nhead,
             configs.model_params.block_num
             ).to(device)
+
         support_dir = configs.support_dir
         subject_gender = "neutral"
         bm_fname = os.path.join(support_dir, 'smplh/{}/model.npz'.format(subject_gender))
@@ -39,10 +41,47 @@ class HMDIMUModel(nn.Module):
         num_betas = 16 # number of body parameters
         num_dmpls = 8 # number of DMPL parameters
         self.bm = BodyModel(bm_fname=bm_fname, num_betas=num_betas, num_dmpls=num_dmpls, dmpl_fname=dmpl_fname).to(device)
+        # --- 开始添加 ---
+        torso_joints      = [0, 1, 2, 3, 6, 9, 12, 13, 14, 15]  # 骨盆, 3個脊柱, 3個脖子/頭部
+        upper_body_joints = [16, 17, 18, 19, 20, 21]           # 左右肩、肘、腕
+        lower_body_joints = [4, 5, 7, 8, 10, 11]              # 左右臀、膝、踝
+
+        self.part_indices = {}
+        self.part_dims = {}
+        self.feature_dims = configs.model_params.hidden_size
+        for part, joints in zip(['torso', 'upper', 'lower'], [torso_joints, upper_body_joints, lower_body_joints]):
+            indices = torch.cat([torch.arange(j * 6, (j + 1) * 6) for j in joints])
+            self.part_indices[part] = indices.long().to(device)
+            self.part_dims[part] = len(indices)
+        # --- 核心修改 2: 實例化新的、帶上下文的修正網路 ---
+        # 軀幹修正頭
+        self.torso_refiner = ContextualRefiner(
+            pose_part_dim=self.part_dims['torso'],
+            feature_dim=self.feature_dims * 3 # 接收完整的全局特徵
+        ).to(device)
+        # 下肢修正頭 (輸入維度增加了修正後的軀幹姿態)
+        self.lower_refiner = ContextualRefiner(
+            pose_part_dim=self.part_dims['lower'],
+            feature_dim=self.feature_dims * 3 + self.part_dims['torso']
+        ).to(device)
+        # 上肢修正頭 (輸入維度增加了修正後的軀幹姿態)
+        self.upper_refiner = ContextualRefiner(
+            pose_part_dim=self.part_dims['upper'],
+            feature_dim=self.feature_dims * 3 + self.part_dims['torso'] + self.part_dims['lower']  # <-- 在这里加上下肢的维度
+        ).to(device)
+        # --- 结束添加 ---
     def forward_kinematics_R(self, R_local: torch.Tensor, parent):
         R_local = R_local.view(R_local.shape[0], -1, 3, 3)
         R_global = _forward_tree(R_local, parent, torch.bmm)
         return R_global
+    # --- 核心修改 3: 新增/修改輔助函數 ---
+    def _get_pose_part(self, full_pose_flat, part_name):
+        return full_pose_flat[:, self.part_indices[part_name]]
+    def _update_pose_part(self, full_pose_flat, part_pose, part_name):
+        # 確保不會在計算圖中產生問題
+        updated_pose = full_pose_flat.clone()
+        updated_pose[:, self.part_indices[part_name]] = part_pose
+        return updated_pose
     def fk_module(self, global_orientation, joint_rotation, body_shape):
         global_orientation = utils_transform.sixd2aa(global_orientation.reshape(-1,6)).reshape(global_orientation.shape[0],-1).float()
         joint_rotation = utils_transform.sixd2aa(joint_rotation.reshape(-1,6)).reshape(joint_rotation.shape[0],-1).float()
@@ -96,17 +135,45 @@ class HMDIMUModel(nn.Module):
             'epoch': epoch}, filename)
 
     def forward(self, sparse_input, do_fk=True):
-        """
-        模型的完整前向传播。
-        当 do_fk=False 时，只执行低成本的网络推理，不进行耗费显存的前向动力学计算。
-        """
         batch_size, time_length = sparse_input.shape[0], sparse_input.shape[1]
 
-        # 步骤1: 低成本的网络推理，得到姿态和体型参数
-        pred_pose, pred_shapes = self.netG(sparse_input)
-        # --- 核心修改 2: 在 forward 函数内部，使用 self 来调用 ---
-        rotation_local_matrot = utils_transform.sixd2matrot(pred_pose.reshape(-1, 6)).reshape(batch_size * time_length,
-                                                                                              22, 3, 3)
+        # 步骤1: 获取原始姿态草稿
+        pose_draft, pred_shapes, aggregated_features = self.netG(sparse_input)
+
+        pose_draft_flat = pose_draft.view(batch_size * time_length, -1)
+        features_flat = aggregated_features.view(batch_size * time_length, -1)
+
+        # --- 核心修改 4: 實現真正的層次化修正資訊流 ---
+
+        # 1. 修正軀幹
+        torso_draft_part = self._get_pose_part(pose_draft_flat, 'torso')
+        torso_residual = self.torso_refiner(torso_draft_part, features_flat)
+        refined_torso_part = torso_draft_part + torso_residual
+        pose_after_torso = self._update_pose_part(pose_draft_flat, refined_torso_part, 'torso')
+
+        # 2. 修正下肢 (使用修正後的軀幹姿態作為額外輸入)
+        lower_draft_part = self._get_pose_part(pose_after_torso, 'lower')
+        # 拼接特徵：全局特徵 + 已修正的軀幹姿態
+        lower_context = torch.cat([features_flat, refined_torso_part], dim=1)
+        lower_residual = self.lower_refiner(lower_draft_part, lower_context)
+        refined_lower_part = lower_draft_part + lower_residual
+        pose_after_lower = self._update_pose_part(pose_after_torso, refined_lower_part, 'lower')
+
+        # 3. 修正上肢 (同樣使用修正後的軀幹姿態作為額外輸入)
+        upper_draft_part = self._get_pose_part(pose_after_lower, 'upper')
+        # 拼接特徵：全局特徵 + 已修正的軀幹姿態
+        refined_lower_part_from_after_lower = self._get_pose_part(pose_after_lower, 'lower')  # 从最新的姿态中提取下肢部分
+        upper_context = torch.cat([features_flat, refined_torso_part, refined_lower_part_from_after_lower], dim=1)
+        upper_residual = self.upper_refiner(upper_draft_part, upper_context)
+        refined_upper_part = upper_draft_part + upper_residual
+        refined_pose_flat = self._update_pose_part(pose_after_lower, refined_upper_part, 'upper')
+
+        refined_pose = refined_pose_flat.view(batch_size, time_length, -1)
+
+        # 后续FK计算
+        rotation_local_matrot = utils_transform.sixd2matrot(refined_pose.reshape(-1, 6)).reshape(
+            batch_size * time_length,
+            22, 3, 3)
         rotation_global_matrot = self.forward_kinematics_R(rotation_local_matrot,
                                                            self.bm.kintree_table[0][:22].long()).view(batch_size,
                                                                                                       time_length, 22,
@@ -117,12 +184,11 @@ class HMDIMUModel(nn.Module):
                                                                                                             22 * 6)
         if do_fk:
             pred_joint_position = self.fk_module(
-                pred_pose[:, :, :6].reshape(-1, 6),
-                pred_pose[:, :, 6:].reshape(-1, 21*6),
+                refined_pose[:, :, :6].reshape(-1, 6),
+                refined_pose[:, :, 6:].reshape(-1, 21 * 6),
                 pred_shapes.reshape(-1, 16)
             )
             pred_joint_position = pred_joint_position.reshape(batch_size, time_length, 22, 3)
-            return pred_pose, pred_shapes, rotation_global_r6d, pred_joint_position
+            return refined_pose, pose_draft, pred_shapes, rotation_global_r6d, pred_joint_position
         else:
-            # 当不做FK时，我们只返回基础的网络输出
-            return pred_pose, pred_shapes
+            return  refined_pose, pose_draft, pred_shapes

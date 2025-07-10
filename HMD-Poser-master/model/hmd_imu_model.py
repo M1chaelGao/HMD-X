@@ -11,31 +11,7 @@ model_wraps = {
     "HMD_imu_HME_Universe": HMD_imu_HME_Universe,
 }
 
-def forward_kinematics_R(R_local: torch.Tensor, parent):
-    r"""
-    :math:`R_global = FK(R_local)`
 
-    Forward kinematics that computes the global rotation of each joint from local rotations. (torch, batch)
-
-    Notes
-    -----
-    A joint's *local* rotation is expressed in its parent's frame.
-
-    A joint's *global* rotation is expressed in the base (root's parent) frame.
-
-    R_local[:, i], parent[i] should be the local rotation and parent joint id of
-    joint i. parent[i] must be smaller than i for any i > 0.
-
-    Args
-    -----
-    :param R_local: Joint local rotation tensor in shape [batch_size, *] that can reshape to
-                    [batch_size, num_joint, 3, 3] (rotation matrices).
-    :param parent: Parent joint id list in shape [num_joint]. Use -1 or None for base id (parent[0]).
-    :return: Joint global rotation, in shape [batch_size, num_joint, 3, 3].
-    """
-    R_local = R_local.view(R_local.shape[0], -1, 3, 3)
-    R_global = _forward_tree(R_local, parent, torch.bmm)
-    return R_global
 
 def _forward_tree(x_local: torch.Tensor, parent, reduction_fn):
     r"""
@@ -65,7 +41,19 @@ class HMDIMUModel(nn.Module):
         num_betas = 16 # number of body parameters
         num_dmpls = 8 # number of DMPL parameters
         self.bm = BodyModel(bm_fname=bm_fname, num_betas=num_betas, num_dmpls=num_dmpls, dmpl_fname=dmpl_fname).to(device)
+    # --- 【关键补充】将函数定义为类方法 ---
+    def forward_kinematics_R(self, R_local: torch.Tensor, parent_list: list):
+        """
+        :math:`R_global = FK(R_local)`
 
+        Forward kinematics that computes the global rotation of each joint from local rotations. (torch, batch)
+        """
+        # 这个函数接收一个纯Python列表作为parent_list，以获得高性能
+        R_local = R_local.view(R_local.shape[0], -1, 3, 3)
+        # _forward_tree 是一个全局辅助函数，可以直接调用
+        R_global = _forward_tree(R_local, parent_list, torch.bmm)
+        return R_global
+    # --- 补充结束 ---
     def fk_module(self, global_orientation, joint_rotation, body_shape):
         global_orientation = utils_transform.sixd2aa(global_orientation.reshape(-1,6)).reshape(global_orientation.shape[0],-1).float()
         joint_rotation = utils_transform.sixd2aa(joint_rotation.reshape(-1,6)).reshape(joint_rotation.shape[0],-1).float()
@@ -77,6 +65,27 @@ class HMDIMUModel(nn.Module):
         joint_position = body_pose.Jtr[:, :22]
         return joint_position
 
+    def _controlled_fk(self, global_orientation, joint_rotation, body_shape, chunk_size=32):
+        full_size = global_orientation.shape[0]
+
+        # 如果数据量不大，直接调用原始的、高性能的fk_module
+        if full_size <= chunk_size:
+            return self.fk_module(global_orientation, joint_rotation, body_shape)
+
+        # 如果数据量很大，则分块处理
+        results = []
+        for i in range(0, full_size, chunk_size):
+            end_idx = min(i + chunk_size, full_size)
+
+            # 对每个小块独立调用原始的 fk_module
+            chunk_pos = self.fk_module(
+                global_orientation[i:end_idx],
+                joint_rotation[i:end_idx],
+                body_shape[i:end_idx]
+            )
+            results.append(chunk_pos)
+
+        return torch.cat(results, dim=0)
     def get_bare_model(self, network):
         """Get bare model, especially under wrapping with
         DistributedDataParallel or DataParallel.
@@ -84,7 +93,6 @@ class HMDIMUModel(nn.Module):
         if isinstance(network, (DataParallel, DistributedDataParallel)):
             network = network.module
         return network
-    
 
     def load_network(self, load_path, network, strict=True, param_key='state_dict'):
         network = self.get_bare_model(network)
@@ -120,13 +128,34 @@ class HMDIMUModel(nn.Module):
 
     def forward(self, sparse_input, do_fk=True):
         batch_size, time_length = sparse_input.shape[0], sparse_input.shape[1]
+
+        # 1. 网络推理
         pred_pose, pred_shapes = self.netG(sparse_input)
-        rotation_local_matrot = utils_transform.sixd2matrot(pred_pose.reshape(-1, 6)).reshape(batch_size*time_length, 22, 3, 3)
-        rotation_global_matrot = forward_kinematics_R(rotation_local_matrot, self.bm.kintree_table[0][:22].long()).view(batch_size, time_length, 22, 3, 3)
-        rotation_global_r6d = utils_transform.matrot2sixd(rotation_global_matrot.reshape(-1, 3, 3)).reshape(batch_size, time_length, 22*6)
+
+        # 2. 计算旋转 (为保证性能，假设 forward_kinematics_R 是带有self的类方法)
+        parent_list_cpu = self.bm.kintree_table[0][:22].long().tolist()
+        rotation_local_matrot = utils_transform.sixd2matrot(pred_pose.reshape(-1, 6)).reshape(batch_size * time_length,
+                                                                                              22, 3, 3)
+        rotation_global_matrot = self.forward_kinematics_R(rotation_local_matrot, parent_list_cpu).view(batch_size,
+                                                                                                        time_length, 22,
+                                                                                                        3, 3)
+        rotation_global_r6d = utils_transform.matrot2sixd(rotation_global_matrot.reshape(-1, 3, 3)).reshape(batch_size,
+                                                                                                            time_length,
+                                                                                                            22 * 6)
+
+        # 3. 计算关节位置
         if do_fk:
-            pred_joint_position = self.fk_module(pred_pose[:, :, :6].reshape(-1, 6), pred_pose[:, :, 6:].reshape(-1, 21*6), pred_shapes.reshape(-1, 16))
+            # 【关键】调用您已经写好的、带内存控制的 _controlled_fk 方法
+            pred_joint_position = self._controlled_fk(
+                pred_pose[:, :, :6].reshape(-1, 6),
+                pred_pose[:, :, 6:].reshape(-1, 21 * 6),
+                pred_shapes.reshape(-1, 16),
+                chunk_size=128  # 可调整的块大小
+            )
             pred_joint_position = pred_joint_position.reshape(batch_size, time_length, 22, 3)
+
+            # 返回4个值，与训练循环匹配
             return pred_pose, pred_shapes, rotation_global_r6d, pred_joint_position
         else:
+            # 当不做FK时，只返回3个值，与验证循环的滑动窗口部分匹配
             return pred_pose, pred_shapes, rotation_global_r6d

@@ -1,7 +1,7 @@
 task: "HMD_IMU_Human_Motion_Estimation"
 
 model_name: "HMD_imu_HME_Universe"
-dataset_path: "/home/wh0146/HMD-Poser-master/data_over_2ear_my/"
+dataset_path: "/home/4T-2/gyf/ProcessedHMDdata/"
 support_dir: "/home/gyf0108/Projects/MambaPoser/body_models/"
 resume_model: null
 manual_seed: null
@@ -21,7 +21,7 @@ train_config:
   epochs: 400
   val_interval: 10
   num_workers: 4
-  batch_size: 64 # 这里原先是256
+  batch_size: 32 # 这里原先是256
   log_interval: 5
 
 optimizer_config:

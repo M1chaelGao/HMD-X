@@ -84,7 +84,26 @@ class HMDIMUModel(nn.Module):
         if isinstance(network, (DataParallel, DistributedDataParallel)):
             network = network.module
         return network
-    
+
+    def _controlled_fk(self, global_orientation, joint_rotation, body_shape, chunk_size=32):
+        full_size = global_orientation.shape[0]
+
+        if full_size <= chunk_size:
+            return self.fk_module(global_orientation, joint_rotation, body_shape)
+
+        results = []
+        for i in range(0, full_size, chunk_size):
+            end_idx = min(i + chunk_size, full_size)
+
+            # 对每个小块独立调用原始的 fk_module
+            chunk_pos = self.fk_module(
+                global_orientation[i:end_idx],
+                joint_rotation[i:end_idx],
+                body_shape[i:end_idx]
+            )
+            results.append(chunk_pos)
+
+        return torch.cat(results, dim=0)
 
     def load_network(self, load_path, network, strict=True, param_key='state_dict'):
         network = self.get_bare_model(network)
@@ -125,7 +144,18 @@ class HMDIMUModel(nn.Module):
         rotation_global_matrot = forward_kinematics_R(rotation_local_matrot, self.bm.kintree_table[0][:22].long()).view(batch_size, time_length, 22, 3, 3)
         rotation_global_r6d = utils_transform.matrot2sixd(rotation_global_matrot.reshape(-1, 3, 3)).reshape(batch_size, time_length, 22*6)
         if do_fk:
-            pred_joint_position = self.fk_module(pred_pose[:, :, :6].reshape(-1, 6), pred_pose[:, :, 6:].reshape(-1, 21*6), pred_shapes.reshape(-1, 16))
+            # --- 这是需要修改的地方 ---
+            # 旧的调用方式:
+            # pred_joint_position = self.fk_module(...)
+
+            # 新的、带内存控制的调用方式:
+            pred_joint_position = self._controlled_fk(
+                pred_pose[:, :, :6].reshape(-1, 6),
+                pred_pose[:, :, 6:].reshape(-1, 21 * 6),
+                pred_shapes.reshape(-1, 16)
+            )
+            # --- 修改结束 ---
+
             pred_joint_position = pred_joint_position.reshape(batch_size, time_length, 22, 3)
             return pred_pose, pred_shapes, rotation_global_r6d, pred_joint_position
         else:

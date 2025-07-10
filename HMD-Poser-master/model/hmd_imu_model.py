@@ -1,16 +1,17 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from model.network import HMD_imu_HME_Universe
+from model.network import HMD_imu_HME_Universe, CnnMSGN
 from utils import utils_transform
 from human_body_prior.body_model.body_model import BodyModel
 import os
 from torch.nn.parallel import DataParallel, DistributedDataParallel
-from .network import  ContextualRefiner
+from .network import ContextualRefiner
 
 model_wraps = {
     "HMD_imu_HME_Universe": HMD_imu_HME_Universe,
 }
+
 
 def _forward_tree(x_local: torch.Tensor, parent, reduction_fn):
     r"""
@@ -22,29 +23,31 @@ def _forward_tree(x_local: torch.Tensor, parent, reduction_fn):
     x_global = torch.stack(x_global, dim=1)
     return x_global
 
+
 class HMDIMUModel(nn.Module):
     def __init__(self, configs, device):
         super().__init__()
         self.netG = model_wraps[configs.model_name](
-            configs.sparse_dim, 
-            configs.model_params.number_layer, 
-            configs.model_params.hidden_size, 
+            configs.sparse_dim,
+            configs.model_params.number_layer,
+            configs.model_params.hidden_size,
             configs.model_params.dropout,
             configs.model_params.nhead,
             configs.model_params.block_num
-            ).to(device)
+        ).to(device)
 
         support_dir = configs.support_dir
         subject_gender = "neutral"
         bm_fname = os.path.join(support_dir, 'smplh/{}/model.npz'.format(subject_gender))
         dmpl_fname = os.path.join(support_dir, 'dmpls/{}/model.npz'.format(subject_gender))
-        num_betas = 16 # number of body parameters
-        num_dmpls = 8 # number of DMPL parameters
-        self.bm = BodyModel(bm_fname=bm_fname, num_betas=num_betas, num_dmpls=num_dmpls, dmpl_fname=dmpl_fname).to(device)
+        num_betas = 16  # number of body parameters
+        num_dmpls = 8  # number of DMPL parameters
+        self.bm = BodyModel(bm_fname=bm_fname, num_betas=num_betas, num_dmpls=num_dmpls, dmpl_fname=dmpl_fname).to(
+            device)
         # --- 开始添加 ---
-        torso_joints      = [0, 1, 2, 3, 6, 9, 12, 13, 14, 15]  # 骨盆, 3個脊柱, 3個脖子/頭部
-        upper_body_joints = [16, 17, 18, 19, 20, 21]           # 左右肩、肘、腕
-        lower_body_joints = [4, 5, 7, 8, 10, 11]              # 左右臀、膝、踝
+        torso_joints = [0, 1, 2, 3, 6, 9, 12, 13, 14, 15]  # 骨盆, 3個脊柱, 3個脖子/頭部
+        upper_body_joints = [16, 17, 18, 19, 20, 21]  # 左右肩、肘、腕
+        lower_body_joints = [4, 5, 7, 8, 10, 11]  # 左右臀、膝、踝
 
         self.part_indices = {}
         self.part_dims = {}
@@ -74,24 +77,33 @@ class HMDIMUModel(nn.Module):
             # 全局特征 + 修正后的躯干 + 修正后的下肢
             hidden_dim=256
         ).to(device)
+
+        # --- 新增MSGN实例化 ---
+        self.msgn = CnnMSGN(input_dim=18, output_dim=3).to(device)
+
     def forward_kinematics_R(self, R_local: torch.Tensor, parent):
         R_local = R_local.view(R_local.shape[0], -1, 3, 3)
         R_global = _forward_tree(R_local, parent, torch.bmm)
         return R_global
+
     # --- 核心修改 3: 新增/修改輔助函數 ---
     def _get_pose_part(self, full_pose_flat, part_name):
         return full_pose_flat[:, self.part_indices[part_name]]
+
     def _update_pose_part(self, full_pose_flat, part_pose, part_name):
         # 確保不會在計算圖中產生問題
         updated_pose = full_pose_flat.clone()
         updated_pose[:, self.part_indices[part_name]] = part_pose
         return updated_pose
+
     def fk_module(self, global_orientation, joint_rotation, body_shape):
-        global_orientation = utils_transform.sixd2aa(global_orientation.reshape(-1,6)).reshape(global_orientation.shape[0],-1).float()
-        joint_rotation = utils_transform.sixd2aa(joint_rotation.reshape(-1,6)).reshape(joint_rotation.shape[0],-1).float()
+        global_orientation = utils_transform.sixd2aa(global_orientation.reshape(-1, 6)).reshape(
+            global_orientation.shape[0], -1).float()
+        joint_rotation = utils_transform.sixd2aa(joint_rotation.reshape(-1, 6)).reshape(joint_rotation.shape[0],
+                                                                                        -1).float()
         body_pose = self.bm(**{
-            'root_orient':global_orientation,
-            'pose_body':joint_rotation,
+            'root_orient': global_orientation,
+            'pose_body': joint_rotation,
             'betas': body_shape.float()
         })
         joint_position = body_pose.Jtr[:, :22]
@@ -104,7 +116,6 @@ class HMDIMUModel(nn.Module):
         if isinstance(network, (DataParallel, DistributedDataParallel)):
             network = network.module
         return network
-    
 
     def load_network(self, load_path, network, strict=True, param_key='state_dict'):
         network = self.get_bare_model(network)
@@ -122,7 +133,8 @@ class HMDIMUModel(nn.Module):
             for k, v in pretrained_state_dict.items():
                 if k in model_state_dict and v.shape == model_state_dict[k].shape:
                     new_pretrained_state_dict[k] = v
-                elif '.'.join([k.split('.')[0], k]) in model_state_dict and v.shape == model_state_dict['.'.join([k.split('.')[0], k])].shape:
+                elif '.'.join([k.split('.')[0], k]) in model_state_dict and v.shape == model_state_dict[
+                    '.'.join([k.split('.')[0], k])].shape:
                     new_pretrained_state_dict['.'.join([k.split('.')[0], k])] = v
             not_inited_params = set(model_state_dict.keys()) - set(new_pretrained_state_dict.keys())
             if len(not_inited_params) > 0:
@@ -136,13 +148,19 @@ class HMDIMUModel(nn.Module):
     def save(self, epoch, filename):
         network = self.get_bare_model(self.netG)
         torch.save({'state_dict': network.state_dict(),
-            'epoch': epoch}, filename)
+                    'epoch': epoch}, filename)
 
-    def forward(self, sparse_input, do_fk=True):
+    def forward(self, sparse_input, raw_imu=None, do_fk=True):
         batch_size, time_length = sparse_input.shape[0], sparse_input.shape[1]
 
         # 步骤1: 获取原始姿态草稿
         pose_draft, pred_shapes, aggregated_features = self.netG(sparse_input)
+
+        # --- 2. 新增：计算门控信号 ---
+        gate_signals = None
+        if raw_imu is not None:
+            # raw_imu 的形状是 [B, T, 18]，正是CnnMSGN期望的
+            gate_signals = self.msgn(raw_imu)
 
         pose_draft_flat = pose_draft.view(batch_size * time_length, -1)
         features_flat = aggregated_features.view(batch_size * time_length, -1)
@@ -191,6 +209,6 @@ class HMDIMUModel(nn.Module):
                 pred_shapes.reshape(-1, 16)
             )
             pred_joint_position = pred_joint_position.reshape(batch_size, time_length, 22, 3)
-            return refined_pose, pose_draft, pred_shapes, rotation_global_r6d, pred_joint_position
+            return refined_pose, pose_draft, pred_shapes, rotation_global_r6d, pred_joint_position, gate_signals
         else:
-            return  refined_pose, pose_draft, pred_shapes
+            return refined_pose, pose_draft, pred_shapes, gate_signals

@@ -35,12 +35,16 @@ def load_data(dataset_path, split, **kwargs):
         gt_positions = data["position_global_full_gt_world"]
         gt_betas = data["body_parms_list"]['betas'][1:]
 
+        # 保存原始IMU数据，不做任何处理
+        raw_imu_data = data["hmd_position_global_full_gt_list"]  # 原始18维IMU数据
+
         valid_motion_data.append({
             'input_feat': input_feat,
             'gt_local_pose': gt_local_pose,
             'gt_global_pose': gt_global_pose,
             'gt_positions': gt_positions,
-            'gt_betas': gt_betas
+            'gt_betas': gt_betas,
+            'raw_imu_data': raw_imu_data  # 添加原始IMU数据
         })
     return valid_motion_data
 
@@ -78,13 +82,15 @@ class TrainDataset(Dataset):
         gt_positions = motion_data['gt_positions'][start_idx: end_idx]
         gt_betas = motion_data['gt_betas'][start_idx: end_idx]
 
+        # 获取相同时间段的原始IMU数据
+        raw_imu_data = motion_data['raw_imu_data'][start_idx: end_idx]
+
         # --- 新增：在这里加入我们为MSGN生成的状态伪标签 ---
         # (这部分逻辑我们在第一周冲刺计划中添加)
         # motion_state_labels = self.calculate_motion_state(gt_positions)
 
-        # 直接返回张量，不再需要为HMD, HMD_2IMUs等模式进行堆叠
-        # return input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas, motion_state_labels
-        return input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas
+        # 添加原始IMU数据到返回值中
+        return input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas, raw_imu_data
 
 
 class TestDataset(Dataset):
@@ -111,7 +117,10 @@ class TestDataset(Dataset):
         gt_positions = motion_data['gt_positions']
         gt_betas = motion_data['gt_betas']
 
+        # 获取完整的原始IMU数据
+        raw_imu_data = motion_data['raw_imu_data']
+
         # 同样，后续可以在这里加入为整个测试序列生成的状态伪标签
 
-        # 直接返回，不再有stack操作
-        return input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas
+        # 添加原始IMU数据到返回值中
+        return input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas, raw_imu_data

@@ -9,47 +9,91 @@ import math
 RADIANS_TO_DEGREES = 360.0 / (2 * math.pi)
 METERS_TO_CENTIMETERS = 100.0
 
+
 def train_loop(configs, device, model, loss_func, optimizer, \
                lr_scheduler, train_loader, test_loader, LOG, train_summary_writer, out_dir, total_loss_main=None):
     global_step = 0
-    best_train_loss, best_test_loss, best_position, best_local_pose = float("inf"), float("inf"), float("inf"), float("inf")
+    best_train_loss, best_test_loss, best_position, best_local_pose = float("inf"), float("inf"), float("inf"), float(
+        "inf")
     for epoch in range(configs.train_config.epochs):
         model.train()
         current_lr = optimizer.param_groups[0]['lr']
         LOG.info(f'Training epoch: {epoch + 1}/{configs.train_config.epochs}, LR: {current_lr:.6f}')
 
         one_epoch_root_loss, one_epoch_lpose_loss, one_epoch_gpose_loss, one_epoch_joint_loss, \
-            one_epoch_acc_loss, one_epoch_shape_loss, one_epoch_total_loss = [], [], [], [], [], [], []
-        for batch_idx, (input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas) in enumerate(train_loader):
+            one_epoch_acc_loss, one_epoch_shape_loss, one_epoch_total_loss, one_epoch_msgn_loss = [], [], [], [], [], [], [], []
+        for batch_idx, (input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas, raw_imu) in enumerate(
+                train_loader):
             global_step += 1
             optimizer.zero_grad()
             batch_start = time.time()
-            input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas = input_feat.to(device).float(), \
+            input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas, raw_imu = input_feat.to(device).float(), \
                 gt_local_pose.to(device).float(), gt_global_pose.to(device).float(), \
-                    gt_positions.to(device).float(), gt_betas.to(device).float()
+                gt_positions.to(device).float(), gt_betas.to(device).float(), raw_imu.to(device).float()
             if len(input_feat.shape) == 4:
-                input_feat = torch.flatten(input_feat, start_dim=0, end_dim=1) # （256,3,40,135）-》（768,40,135） 3种模态的输入
+                input_feat = torch.flatten(input_feat, start_dim=0, end_dim=1)  # （256,3,40,135）-》（768,40,135） 3种模态的输入
                 gt_local_pose = torch.flatten(gt_local_pose, start_dim=0, end_dim=1)
                 gt_global_pose = torch.flatten(gt_global_pose, start_dim=0, end_dim=1)
                 gt_positions = torch.flatten(gt_positions, start_dim=0, end_dim=1)
                 gt_betas = torch.flatten(gt_betas, start_dim=0, end_dim=1)
+                raw_imu = torch.flatten(raw_imu, start_dim=0, end_dim=1)
 
-            refined_pose, pose_draft, pred_shapes, rotation_global_r6d, pred_joint_position = model(input_feat)
+            refined_pose, pose_draft, pred_shapes, rotation_global_r6d, pred_joint_position, gate_signals = model(
+                input_feat, raw_imu=raw_imu)
             pred_local_pose = refined_pose
             pred_betas = pred_shapes
-            pred_joint_position_head_centered = pred_joint_position - pred_joint_position[:, :, 15:16] + gt_positions[:, :, 15:16]  # 把输入的头部位置作为最终的
+            pred_joint_position_head_centered = pred_joint_position - pred_joint_position[:, :, 15:16] + gt_positions[:,
+                                                                                                         :,
+                                                                                                         15:16]  # 把输入的头部位置作为最终的
             gt_positions_head_centered = gt_positions
 
             root_orientation_loss, local_pose_loss, global_pose_loss, joint_position_loss, accel_loss, shape_loss, total_loss_main = \
-                loss_func(pred_local_pose[:, :, :6], pred_local_pose[:, :, 6:], rotation_global_r6d, pred_joint_position_head_centered, pred_betas, \
-                          gt_local_pose[:, :, :6], gt_local_pose[:, :, 6:], gt_global_pose, gt_positions_head_centered, gt_betas)
+                loss_func(pred_local_pose[:, :, :6], pred_local_pose[:, :, 6:], rotation_global_r6d,
+                          pred_joint_position_head_centered, pred_betas, \
+                          gt_local_pose[:, :, :6], gt_local_pose[:, :, 6:], gt_global_pose, gt_positions_head_centered,
+                          gt_betas)
             # 2. 计算辅助损失 (针对原始草稿的L1损失)
             #    注意：这里的gt_local_pose是和pose_draft维度完全匹配的真值
             loss_draft = torch.nn.functional.l1_loss(pose_draft, gt_local_pose)
             # 3. 合并成最终的总损失
             alpha = 0.3  # 这是一个超参数，您可以根据实验效果调整
             total_loss = total_loss_main + alpha * loss_draft
-            # --- 修改结束 ---
+
+            # --- 新增 MSGN 辅助损失计算 ---
+            # --- 新增 MSGN 辅助损失计算 ---
+            loss_msgn = 0.0
+            if gate_signals is not None:
+                # 1. 创建伪标签 (pseudo label)
+                # 我们用真实姿态在时间上的速度作为运动状态的衡量标准
+                # 速度越大，我们期望门控信号越接近1
+                gt_pose_velocity = torch.linalg.norm(gt_local_pose[:, 1:] - gt_local_pose[:, :-1], dim=-1)
+
+                # 将速度归一化到0-1之间，作为伪标签。这里使用一个简单的缩放+sigmoid
+                # 重要修复：确保形状匹配
+                pseudo_gate_label = torch.sigmoid(
+                    (gt_pose_velocity - gt_pose_velocity.mean()) / (gt_pose_velocity.std() + 1e-8))
+
+                # 我们需要为3个身体部位都创建这个标签，简单起见先直接复制
+                # 注意确保形状正确 [B, T-1, 3]
+                pseudo_gate_label = pseudo_gate_label.unsqueeze(-1).repeat(1, 1, 3)
+
+                # 确保gate_signals和pseudo_gate_label有相同的时间维度长度
+                # 修复：查看两个张量的实际形状并截取合适的部分
+                time_len = min(gate_signals.shape[1] - 1, pseudo_gate_label.shape[1])
+
+                # 2. 计算MSE损失
+                # 注意对齐时间维度
+                loss_msgn = torch.nn.functional.mse_loss(
+                    gate_signals[:, :time_len, :],  # 使用公共长度
+                    pseudo_gate_label[:, :time_len, :]  # 使用公共长度
+                )
+
+                # 3. 将MSGN损失加入总损失
+                beta = 0.1  # MSGN损失的权重，可调
+                total_loss = total_loss + beta * loss_msgn
+
+            # --- 辅助损失计算结束 ---
+
             # loss是l1损失
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(
@@ -67,8 +111,9 @@ def train_loop(configs, device, model, loss_func, optimizer, \
             one_epoch_acc_loss.append(accel_loss.item())
             one_epoch_shape_loss.append(shape_loss.item())
             one_epoch_total_loss.append(total_loss.item())
+            one_epoch_msgn_loss.append(loss_msgn.item() if isinstance(loss_msgn, torch.Tensor) else loss_msgn)
             batch_time = time.time() - batch_start
-            
+
             if batch_idx % configs.train_config.log_interval == 0:
                 batch_info = {
                     'type': 'train',
@@ -82,9 +127,11 @@ def train_loop(configs, device, model, loss_func, optimizer, \
                     'joint_3d_loss': round(float(joint_position_loss.item()), 3),
                     'smooth_loss': round(float(accel_loss.item()), 3),
                     'shape_loss': round(float(shape_loss.item()), 3),
-                    'loss_draft': round(float(loss_draft.item()), 3)
+                    'loss_draft': round(float(loss_draft.item()), 3),
+                    'loss_msgn': round(float(loss_msgn.item() if isinstance(loss_msgn, torch.Tensor) else loss_msgn), 3)
                 }
                 LOG.info(batch_info)
+
         one_epoch_root_loss = torch.tensor(one_epoch_root_loss).mean().item()
         one_epoch_lpose_loss = torch.tensor(one_epoch_lpose_loss).mean().item()
         one_epoch_gpose_loss = torch.tensor(one_epoch_gpose_loss).mean().item()
@@ -92,6 +139,7 @@ def train_loop(configs, device, model, loss_func, optimizer, \
         one_epoch_acc_loss = torch.tensor(one_epoch_acc_loss).mean().item()
         one_epoch_shape_loss = torch.tensor(one_epoch_shape_loss).mean().item()
         one_epoch_total_loss = torch.tensor(one_epoch_total_loss).mean().item()
+        one_epoch_msgn_loss = torch.tensor(one_epoch_msgn_loss).mean().item()
 
         train_summary_writer.add_scalar(
             'train_epoch_loss/loss_total', one_epoch_total_loss, epoch)
@@ -107,6 +155,8 @@ def train_loop(configs, device, model, loss_func, optimizer, \
             'train_epoch_loss/smooth_loss', one_epoch_acc_loss, epoch)
         train_summary_writer.add_scalar(
             'train_epoch_loss/shape_loss', one_epoch_shape_loss, epoch)
+        train_summary_writer.add_scalar(
+            'train_epoch_loss/msgn_loss', one_epoch_msgn_loss, epoch)
 
         epoch_info = {
             'type': 'train',
@@ -117,12 +167,13 @@ def train_loop(configs, device, model, loss_func, optimizer, \
             'global_pose_loss': round(float(one_epoch_gpose_loss), 3),
             'joint_3d_loss': round(float(one_epoch_joint_loss), 3),
             'smooth_loss': round(float(one_epoch_acc_loss), 3),
-            'shape_loss': round(float(one_epoch_shape_loss), 3)
+            'shape_loss': round(float(one_epoch_shape_loss), 3),
+            'msgn_loss': round(float(one_epoch_msgn_loss), 3)
         }
         LOG.info(epoch_info)
 
         if one_epoch_total_loss < best_train_loss:
-            LOG.info("Saving model with best train loss in epoch {}".format(epoch+1))
+            LOG.info("Saving model with best train loss in epoch {}".format(epoch + 1))
             filename = os.path.join(out_dir, "epoch_with_best_trainloss.pt")
             if os.path.exists(filename):
                 os.remove(filename)
@@ -138,17 +189,19 @@ def train_loop(configs, device, model, loss_func, optimizer, \
                 'pos_error': [], 'rot_error': []
             }
             with torch.no_grad():
-                for _, (input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas) in tqdm(
+                for _, (input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas, raw_imu) in tqdm(
                         enumerate(test_loader)):
-                    input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas = input_feat.to(device).float(), \
+                    input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas, raw_imu = input_feat.to(
+                        device).float(), \
                         gt_local_pose.to(device).float(), gt_global_pose.to(device).float(), \
-                        gt_positions.to(device).float(), gt_betas.to(device).float()
+                        gt_positions.to(device).float(), gt_betas.to(device).float(), raw_imu.to(device).float()
                     if len(input_feat.shape) == 4:
                         input_feat = torch.flatten(input_feat, start_dim=0, end_dim=1)
                         gt_local_pose = torch.flatten(gt_local_pose, start_dim=0, end_dim=1)
                         gt_global_pose = torch.flatten(gt_global_pose, start_dim=0, end_dim=1)
                         gt_positions = torch.flatten(gt_positions, start_dim=0, end_dim=1)
                         gt_betas = torch.flatten(gt_betas, start_dim=0, end_dim=1)
+                        raw_imu = torch.flatten(raw_imu, start_dim=0, end_dim=1)
 
                     # ------------------- 核心修改：滑动窗口验证 -------------------
 
@@ -156,7 +209,7 @@ def train_loop(configs, device, model, loss_func, optimizer, \
                     chunk_size = configs.input_motion_length
 
                     if full_seq_len <= chunk_size:
-                        pred_local_pose, _, pred_betas = model(input_feat, do_fk=False)
+                        pred_local_pose, _, pred_betas, _ = model(input_feat, raw_imu=raw_imu, do_fk=False)
                     else:
                         stride = chunk_size // 2
                         pred_pose_chunks = []
@@ -171,7 +224,9 @@ def train_loop(configs, device, model, loss_func, optimizer, \
                                 start_idx = end_idx - chunk_size
 
                             input_chunk = input_feat[:, start_idx:end_idx]
-                            pred_pose_chunk, _, pred_betas_chunk = model(input_chunk, do_fk=False)
+                            raw_imu_chunk = raw_imu[:, start_idx:end_idx]
+                            pred_pose_chunk, _, pred_betas_chunk, _ = model(input_chunk, raw_imu=raw_imu_chunk,
+                                                                            do_fk=False)
                             pred_pose_chunks.append(pred_pose_chunk)
                             pred_betas_chunks.append(pred_betas_chunk)
 
@@ -255,7 +310,7 @@ def train_loop(configs, device, model, loss_func, optimizer, \
                     val_metrics['shape_loss'].append(shape_loss.item())
                     val_metrics['pos_error'].append(pos_error.item() * METERS_TO_CENTIMETERS)
                     val_metrics['rot_error'].append(rot_error.item() * RADIANS_TO_DEGREES)
-            
+
             avg_total_loss = np.mean(val_metrics['total_loss'])
             avg_root_loss = np.mean(val_metrics['root_loss'])
             avg_lpose_loss = np.mean(val_metrics['lpose_loss'])
@@ -302,17 +357,17 @@ def train_loop(configs, device, model, loss_func, optimizer, \
             model.train()
 
             if avg_total_loss < best_test_loss:
-                LOG.info("Saving model with lowest test loss in epoch {}".format(epoch+1))
+                LOG.info("Saving model with lowest test loss in epoch {}".format(epoch + 1))
                 filename = os.path.join(out_dir, "epoch_with_best_testloss.pt")
                 if os.path.exists(filename):
                     os.remove(filename)
                 model.save(epoch, filename)
                 best_test_loss = avg_total_loss
-            
+
             if avg_pos_error < best_position:
                 best_position = avg_pos_error
-                LOG.info("Lowest MPJPE {} in epoch {}".format(best_position, epoch+1))
-            
+                LOG.info("Lowest MPJPE {} in epoch {}".format(best_position, epoch + 1))
+
             if avg_rot_error < best_local_pose:
                 best_local_pose = avg_rot_error
-                LOG.info("Lowest MPJRE_(including root) {} in epoch {}".format(best_local_pose, epoch+1))
+                LOG.info("Lowest MPJRE_(including root) {} in epoch {}".format(best_local_pose, epoch + 1))

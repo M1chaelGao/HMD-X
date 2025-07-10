@@ -6,6 +6,7 @@ import torch.nn.utils.weight_norm as weightNorm
 from functools import partial
 from torch.nn import functional as F
 
+
 class TemporalSpatialBackbone(torch.nn.Module):
     def __init__(self, input_dim, number_layer=3, hidden_size=256, dropout=0.05, nhead=8, block_num=2):
         super().__init__()
@@ -46,12 +47,12 @@ class TemporalSpatialBackbone(torch.nn.Module):
         for encoder_i in self.time_encoder:
             for model_i in encoder_i:
                 for layeridx in range(num_rnn_layer):
-                    model_i = weightNorm( model_i, f"weight_ih_l{layeridx}"  )
-                    model_i = weightNorm( model_i, f"weight_hh_l{layeridx}"  )
+                    model_i = weightNorm(model_i, f"weight_ih_l{layeridx}")
+                    model_i = weightNorm(model_i, f"weight_hh_l{layeridx}")
                 for name, param in model_i.named_parameters():
                     if name.startswith("weight"):
                         torch.nn.init.orthogonal_(param)
-    
+
     def forward(self, x_in, rnn_state=None):
         batch_size, time_seq = x_in.shape[0], x_in.shape[1]
 
@@ -87,6 +88,7 @@ class TemporalSpatialBackbone(torch.nn.Module):
 
         return collect_feats
 
+
 class HMD_imu_HME_Universe(torch.nn.Module):
     def __init__(self, input_dim, number_layer=3, hidden_size=256, dropout=0.05, nhead=8, block_num=2):
         super().__init__()
@@ -97,16 +99,16 @@ class HMD_imu_HME_Universe(torch.nn.Module):
         # 解码器的输入维度现在由backbone的输出决定
         # 我们的backbone输出是 [B, T, 3, hidden_size]，所以展平后是 hidden_size*3
         self.pose_est_head = nn.Sequential(
-                                nn.Linear(hidden_size * 2, 256),
-                                nn.LeakyReLU(),
-                                nn.Linear(256, 22 * 6)
-            )
+            nn.Linear(hidden_size * 2, 256),
+            nn.LeakyReLU(),
+            nn.Linear(256, 22 * 6)
+        )
 
         self.shape_est_head = nn.Sequential(
-                            nn.Linear(hidden_size * 2, 256),
-                            nn.LeakyReLU(),
-                            nn.Linear(256, 16)
-            )
+            nn.Linear(hidden_size * 2, 256),
+            nn.LeakyReLU(),
+            nn.Linear(256, 16)
+        )
 
     def forward(self, x_in, rnn_state=None):
         # Backbone輸出原始特徵和姿態草稿
@@ -147,3 +149,45 @@ class ContextualRefiner(nn.Module):
         combined_input = torch.cat([pose_part_flat, context_flat], dim=-1)
         return self.network(combined_input)
     # --- 结束替换forward方法 ---
+
+
+class CnnMSGN(nn.Module):
+    def __init__(self, input_dim=18, output_dim=3, cnn_out_channels=32, kernel_size=7):
+        super().__init__()
+        # Calculate padding to keep sequence length unchanged
+        padding = (kernel_size - 1) // 2
+
+        # CNN layer for temporal feature extraction
+        self.cnn = nn.Conv1d(
+            in_channels=input_dim,
+            out_channels=cnn_out_channels,
+            kernel_size=kernel_size,
+            padding=padding
+        )
+
+        # Fully connected layers for gating signal generation
+        self.fc = nn.Sequential(
+            nn.Linear(cnn_out_channels, 64),
+            nn.ReLU(),
+            nn.Linear(64, output_dim)
+        )
+
+    def forward(self, raw_imu_sequence):
+        # Input shape: [Batch, SeqLen, 18]
+        # Reshape for Conv1d: [Batch, 18, SeqLen]
+        x = raw_imu_sequence.permute(0, 2, 1)
+
+        # Apply CNN and ReLU activation
+        x = F.relu(self.cnn(x))
+
+        # Reshape back: [Batch, SeqLen, cnn_out_channels]
+        x = x.permute(0, 2, 1)
+
+        # Apply fully connected layers to get logits
+        logits = self.fc(x)
+
+        # Apply sigmoid to get gating signals
+        gate_signals = torch.sigmoid(logits)
+
+        # Return gating signals with shape [Batch, SeqLen, 3]
+        return gate_signals

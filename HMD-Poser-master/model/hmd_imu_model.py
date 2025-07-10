@@ -48,28 +48,32 @@ class HMDIMUModel(nn.Module):
 
         self.part_indices = {}
         self.part_dims = {}
-        self.feature_dims = configs.model_params.hidden_size
+        self.agg_feature_dim = self.netG.feature_dim
+
         for part, joints in zip(['torso', 'upper', 'lower'], [torso_joints, upper_body_joints, lower_body_joints]):
             indices = torch.cat([torch.arange(j * 6, (j + 1) * 6) for j in joints])
             self.part_indices[part] = indices.long().to(device)
             self.part_dims[part] = len(indices)
-        # --- 核心修改 2: 實例化新的、帶上下文的修正網路 ---
-        # 軀幹修正頭
+
+        # --- 核心修正 2: 实例化具有正确输入维度的修正网络 ---
         self.torso_refiner = ContextualRefiner(
-            pose_part_dim=self.part_dims['torso'],
-            feature_dim=self.feature_dims * 3 # 接收完整的全局特徵
+            pose_part_dim=self.part_dims['torso'],  # 躯干姿态本身的维度
+            feature_dim=self.agg_feature_dim,  # 全局特征的维度
+            hidden_dim=256
         ).to(device)
-        # 下肢修正頭 (輸入維度增加了修正後的軀幹姿態)
+
         self.lower_refiner = ContextualRefiner(
-            pose_part_dim=self.part_dims['lower'],
-            feature_dim=self.feature_dims * 3 + self.part_dims['torso']
+            pose_part_dim=self.part_dims['lower'],  # 下肢姿态本身的维度
+            feature_dim=self.agg_feature_dim + self.part_dims['torso'],  # 全局特征 + 已修正的躯干姿态
+            hidden_dim=256
         ).to(device)
-        # 上肢修正頭 (輸入維度增加了修正後的軀幹姿態)
+
         self.upper_refiner = ContextualRefiner(
-            pose_part_dim=self.part_dims['upper'],
-            feature_dim=self.feature_dims * 3 + self.part_dims['torso'] + self.part_dims['lower']  # <-- 在这里加上下肢的维度
+            pose_part_dim=self.part_dims['upper'],  # 上肢姿态本身的维度
+            feature_dim=self.agg_feature_dim + self.part_dims['torso'] + self.part_dims['lower'],
+            # 全局特征 + 修正后的躯干 + 修正后的下肢
+            hidden_dim=256
         ).to(device)
-        # --- 结束添加 ---
     def forward_kinematics_R(self, R_local: torch.Tensor, parent):
         R_local = R_local.view(R_local.shape[0], -1, 3, 3)
         R_global = _forward_tree(R_local, parent, torch.bmm)
@@ -143,30 +147,28 @@ class HMDIMUModel(nn.Module):
         pose_draft_flat = pose_draft.view(batch_size * time_length, -1)
         features_flat = aggregated_features.view(batch_size * time_length, -1)
 
-        # --- 核心修改 4: 實現真正的層次化修正資訊流 ---
-
-        # 1. 修正軀幹
+        # 1. 修正躯干
         torso_draft_part = self._get_pose_part(pose_draft_flat, 'torso')
+        # 直接将 pose 和 feature 传进去，让模块内部拼接
         torso_residual = self.torso_refiner(torso_draft_part, features_flat)
         refined_torso_part = torso_draft_part + torso_residual
         pose_after_torso = self._update_pose_part(pose_draft_flat, refined_torso_part, 'torso')
 
-        # 2. 修正下肢 (使用修正後的軀幹姿態作為額外輸入)
+        # 2. 修正下肢
         lower_draft_part = self._get_pose_part(pose_after_torso, 'lower')
-        # 拼接特徵：全局特徵 + 已修正的軀幹姿態
         lower_context = torch.cat([features_flat, refined_torso_part], dim=1)
         lower_residual = self.lower_refiner(lower_draft_part, lower_context)
         refined_lower_part = lower_draft_part + lower_residual
         pose_after_lower = self._update_pose_part(pose_after_torso, refined_lower_part, 'lower')
 
-        # 3. 修正上肢 (同樣使用修正後的軀幹姿態作為額外輸入)
+        # 3. 修正上肢
         upper_draft_part = self._get_pose_part(pose_after_lower, 'upper')
-        # 拼接特徵：全局特徵 + 已修正的軀幹姿態
-        refined_lower_part_from_after_lower = self._get_pose_part(pose_after_lower, 'lower')  # 从最新的姿态中提取下肢部分
+        refined_lower_part_from_after_lower = self._get_pose_part(pose_after_lower, 'lower')
         upper_context = torch.cat([features_flat, refined_torso_part, refined_lower_part_from_after_lower], dim=1)
         upper_residual = self.upper_refiner(upper_draft_part, upper_context)
         refined_upper_part = upper_draft_part + upper_residual
         refined_pose_flat = self._update_pose_part(pose_after_lower, refined_upper_part, 'upper')
+        # --- 修改结束 ---
 
         refined_pose = refined_pose_flat.view(batch_size, time_length, -1)
 

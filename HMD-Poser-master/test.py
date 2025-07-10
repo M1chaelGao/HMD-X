@@ -1,3 +1,5 @@
+# 文件: test.py (最终版)
+
 import torch
 from tqdm import tqdm
 import argparse
@@ -9,13 +11,11 @@ from utils import utils_transform
 import math
 from utils.metrics import get_metric_function
 import prettytable as pt
+import numpy as np  # 确保导入numpy
 
-
-
-#####################
+# --- 指标定义与常量 (保持不变) ---
 RADIANS_TO_DEGREES = 360.0 / (2 * math.pi)
 METERS_TO_CENTIMETERS = 100.0
-
 
 pred_metrics = [
     "mpjre",
@@ -36,7 +36,6 @@ gt_metrics = [
 ]
 all_metrics = pred_metrics + gt_metrics
 
-RADIANS_TO_DEGREES = 360.0 / (2 * math.pi)  # 57.2958 grads
 metrics_coeffs = {
     "mpjre": RADIANS_TO_DEGREES,
     "mpjpe": METERS_TO_CENTIMETERS,
@@ -53,105 +52,103 @@ metrics_coeffs = {
     "gt_jitter": 1.0,
 }
 
-#####################
+
+# --- 定义结束 ---
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, help="Path, where config file is stored")
+    parser.add_argument("--config", type=str, default="./options/test_config.yaml",
+                        help="Path, where config file is stored")
     args = parser.parse_args()
     return args
 
+
 def main():
     args = parse_args()
-    args.config = "./options/test_config.yaml"
     configs = load_config(args.config)
-    device = torch.device('cuda:2' if torch.cuda.is_available() else 'cpu')
-    test_datas = load_data(configs.dataset_path, "test", 
-        input_motion_length=configs.input_motion_length)
+    # 推荐将设备选择也放入配置中，但这里为了方便直接指定
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
 
+    # 加载测试数据
+    test_datas = load_data(configs.dataset_path, "test",
+                           input_motion_length=configs.input_motion_length)
+
+    # 创建并加载模型
+    # 【关键】确保这里的 configs 与您训练18D基线时使用的模型参数一致
     model = HMDIMUModel(configs, device)
     model.load(configs.resume_model)
-    print(f"successfully resume checkpoint in {configs.resume_model}")
+    print(f"Successfully resumed checkpoint from {configs.resume_model}")
     model.eval()
 
-    # Print the value for all the metrics
+    # 初始化结果表格
     tb = pt.PrettyTable()
     tb.field_names = ['Input_type'] + pred_metrics + gt_metrics
 
+    # 循环处理不同的测试条件 (例如 HMD, HMD+2IMUs ...)
     for input_type in configs.compatible_inputs:
-        print(f"Testing on {input_type}")
-        test_dataset = TestDataset(test_datas, [input_type], 
-            configs.input_motion_length, 1)
+        print(f"Testing on {input_type}...")
+        test_dataset = TestDataset(test_datas, [input_type],
+                                   configs.input_motion_length, 1)
         test_dataloader = DataLoader(
             test_dataset,
-            batch_size=1,
+            batch_size=1,  # 测试时batch_size通常为1，以处理不同长度的序列
             shuffle=False,
             num_workers=1,
             drop_last=False
         )
 
-        log = {}
-        for metric in all_metrics:
-            log[metric] = 0
-
-        # 初始化存储张量的列表
-        all_gt_angles = []
-        all_predicted_angles = []
-        all_gt_trans = []
-        all_predicted_trans = []
+        log = {metric: 0.0 for metric in all_metrics}
 
         with torch.no_grad():
-            for _, (input_feat, gt_local_pose, gt_global_pose, gt_positions, head_global_trans) in tqdm(enumerate(test_dataloader)):
-                input_feat, gt_local_pose, gt_global_pose, gt_positions, head_global_trans = input_feat.to(device).float(), \
-                    gt_local_pose.to(device).float(), gt_global_pose.to(device).float(), \
-                        gt_positions.to(device).float(), head_global_trans.to(device).float()
-                
+            for _, (input_feat, gt_local_pose, gt_global_pose, gt_positions, head_global_trans) in tqdm(
+                    enumerate(test_dataloader)):
+
+                # --- 数据移动与预处理 ---
+                input_feat = input_feat.to(device).float()
+                gt_local_pose = gt_local_pose.to(device).float()
+                gt_positions = gt_positions.to(device).float()
+                # flatten操作以匹配模型输入
                 if len(input_feat.shape) == 4:
                     input_feat = torch.flatten(input_feat, start_dim=0, end_dim=1)
                     gt_local_pose = torch.flatten(gt_local_pose, start_dim=0, end_dim=1)
-                    gt_global_pose = torch.flatten(gt_global_pose, start_dim=0, end_dim=1)
                     gt_positions = torch.flatten(gt_positions, start_dim=0, end_dim=1)
-                    head_global_trans = torch.flatten(head_global_trans, start_dim=0, end_dim=1)
 
-                batch_size, time_seq = input_feat.shape[0], input_feat.shape[1]
-                pred_local_pose, _, rotation_global_r6d, pred_joint_position = model(input_feat)
-                
-                pred_local_pose_aa = utils_transform.sixd2aa(pred_local_pose.reshape(-1, 6).detach()).reshape(batch_size*time_seq, 22*3)
-                gt_local_pose_aa = utils_transform.sixd2aa(gt_local_pose.reshape(-1, 6).detach()).reshape(batch_size*time_seq, 22*3)
-                gt_positions = gt_positions.reshape(batch_size*time_seq, 22, 3).detach()
-                pred_joint_position = pred_joint_position.reshape(batch_size*time_seq, 22, 3).detach()
+                # --- 【核心修改】模型调用与返回值处理 ---
+                batch_size, time_seq = input_feat.shape[:2]
+
+                # 1. 正确解包模型返回的4个值
+                #    do_fk=True确保我们能得到 pred_joint_position
+                pred_local_pose, pred_shapes, rotation_global_r6d, pred_joint_position = model(input_feat, do_fk=True)
+
+                # --- 数据后处理，用于评估 ---
+                # 2. 将6D旋转转换为轴角(axis-angle)表示，用于MPJRE计算
+                pred_local_pose_aa = utils_transform.sixd2aa(pred_local_pose.reshape(-1, 6).detach()).reshape(
+                    batch_size * time_seq, -1)
+                gt_local_pose_aa = utils_transform.sixd2aa(gt_local_pose.reshape(-1, 6).detach()).reshape(
+                    batch_size * time_seq, -1)
+
+                # 3. 准备用于MPJPE计算的3D关节位置
+                gt_positions = gt_positions.reshape(batch_size * time_seq, 22, 3).detach()
+                pred_joint_position = pred_joint_position.reshape(batch_size * time_seq, 22, 3).detach()
+                # 使用真实头部位置进行对齐，这是该领域的标准评估方法
                 pred_joint_position = pred_joint_position - pred_joint_position[:, 15:16] + gt_positions[:, 15:16]
 
-                # skate = skating_error(predicted_position, gt_position) * 100
-                # error_dict['Skate'].append(skate_error_)
-                predicted_angle = pred_local_pose_aa[...,3:66]
-                predicted_root_angle = pred_local_pose_aa[...,:3]
+                # 4. 统一变量命名，供 get_metric_function 调用
                 predicted_position = pred_joint_position
-
-                gt_angle = gt_local_pose_aa[...,3:66]
-                gt_root_angle = gt_local_pose_aa[...,:3]
                 gt_position = gt_positions
+                predicted_angle = pred_local_pose_aa[..., 3:66]  # 身体关节旋转
+                predicted_root_angle = pred_local_pose_aa[..., :3]  # 根关节旋转
+                gt_angle = gt_local_pose_aa[..., 3:66]
+                gt_root_angle = gt_angle_aa[..., :3]
 
+                # 定义评估指标所需要的身体部位索引
                 upper_index = [3, 6, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
                 lower_index = [0, 1, 2, 4, 5, 7, 8, 10, 11]
                 eval_log = {}
 
-                # 将 root_orient 添加到 gt_angle 和 predicted_angle
-                gt_angle_0 = torch.cat((gt_root_angle, gt_angle), dim=1)  # (seq, 66)
-                predicted_angle_0 =  pred_local_pose_aa[...,:66]  # (seq, 66)
-
-                # 拼接 3x2 的零向量，使其变为 (seq, 72)
-                zeros_to_add = torch.zeros(gt_angle.size(0), 6, device=gt_angle.device)  # (seq, 6)
-                gt_angle_0 = torch.cat((gt_angle_0, zeros_to_add), dim=1)  # (seq, 72)
-                predicted_angle_0 = torch.cat((predicted_angle_0, zeros_to_add), dim=1)  # (seq, 72)
-                gt_trans = torch.zeros(gt_angle.size(0), 1, device=gt_angle.device)
-
-                # 将张量添加到对应的列表中
-                all_gt_angles.append(gt_angle_0)
-                all_predicted_angles.append(predicted_angle_0)
-                all_gt_trans.append(gt_trans)
-                all_predicted_trans.append(gt_trans)
-
+                # 5. 循环计算所有指标
                 for metric in all_metrics:
                     eval_log[metric] = (
                         get_metric_function(metric)(
@@ -168,25 +165,21 @@ def main():
                         .cpu()
                         .numpy()
                     )
-                
+
                 for key in eval_log:
                     log[key] += eval_log[key]
-        # # 将这些张量存入字典
-        # results = {
-        #     'gt_angle': all_gt_angles,
-        #     'predicted_angle': all_predicted_angles,
-        #     'gt_trans': all_gt_trans,
-        #     'predicted_trans': all_predicted_trans
-        # }
-        # # 动态生成新的文件名
-        # new_filename = f"{input_type}_vis.pt"
-        # # 保存为 .pt 文件
-        # torch.save(results, new_filename)
-        tb.add_row([input_type] + 
-            [ '%.2f' % (log[metric] / len(test_dataloader) * metrics_coeffs[metric]) for metric in pred_metrics] +
-            [ '%.2f' % (log[metric] / len(test_dataloader) * metrics_coeffs[metric]) for metric in gt_metrics]
-        )
+
+        # 循环结束后，计算平均值并添加到表格中
+        row_data = [input_type]
+        for metric in all_metrics:
+            avg_metric_value = log[metric] / len(test_dataloader) * metrics_coeffs.get(metric, 1.0)
+            row_data.append('%.2f' % avg_metric_value)
+        tb.add_row(row_data)
+
+    # 打印最终的结果表格
+    print("\n" + "=" * 20 + " Test Results " + "=" * 20)
     print(tb)
+
 
 if __name__ == "__main__":
     main()

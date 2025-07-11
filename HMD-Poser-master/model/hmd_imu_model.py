@@ -6,7 +6,7 @@ from utils import utils_transform
 from human_body_prior.body_model.body_model import BodyModel
 import os
 from torch.nn.parallel import DataParallel, DistributedDataParallel
-from .network import ContextualRefiner
+from .network import ContextualRefiner, MoEHead
 
 model_wraps = {
     "HMD_imu_HME_Universe": HMD_imu_HME_Universe,
@@ -59,19 +59,19 @@ class HMDIMUModel(nn.Module):
             self.part_dims[part] = len(indices)
 
         # --- 核心修正 2: 实例化具有正确输入维度的修正网络 ---
-        self.torso_refiner = ContextualRefiner(
+        self.torso_refiner = MoEHead(
             pose_part_dim=self.part_dims['torso'],  # 躯干姿态本身的维度
             feature_dim=self.agg_feature_dim,  # 全局特征的维度
             hidden_dim=256
         ).to(device)
 
-        self.lower_refiner = ContextualRefiner(
+        self.lower_refiner = MoEHead(
             pose_part_dim=self.part_dims['lower'],  # 下肢姿态本身的维度
             feature_dim=self.agg_feature_dim + self.part_dims['torso'],  # 全局特征 + 已修正的躯干姿态
             hidden_dim=256
         ).to(device)
 
-        self.upper_refiner = ContextualRefiner(
+        self.upper_refiner = MoEHead(
             pose_part_dim=self.part_dims['upper'],  # 上肢姿态本身的维度
             feature_dim=self.agg_feature_dim + self.part_dims['torso'] + self.part_dims['lower'],
             # 全局特征 + 修正后的躯干 + 修正后的下肢
@@ -162,20 +162,23 @@ class HMDIMUModel(nn.Module):
             # raw_imu 的形状是 [B, T, 18]，正是CnnMSGN期望的
             gate_signals = self.msgn(raw_imu)
 
+        # 切片门控信号，为三个部位各提取一个通道
+        C_torso, C_lower, C_upper = gate_signals.split(1, dim=-1)
+
         pose_draft_flat = pose_draft.view(batch_size * time_length, -1)
         features_flat = aggregated_features.view(batch_size * time_length, -1)
 
         # 1. 修正躯干
         torso_draft_part = self._get_pose_part(pose_draft_flat, 'torso')
         # 直接将 pose 和 feature 传进去，让模块内部拼接
-        torso_residual = self.torso_refiner(torso_draft_part, features_flat)
+        torso_residual = self.torso_refiner(torso_draft_part, features_flat, C_torso)
         refined_torso_part = torso_draft_part + torso_residual
         pose_after_torso = self._update_pose_part(pose_draft_flat, refined_torso_part, 'torso')
 
         # 2. 修正下肢
         lower_draft_part = self._get_pose_part(pose_after_torso, 'lower')
         lower_context = torch.cat([features_flat, refined_torso_part], dim=1)
-        lower_residual = self.lower_refiner(lower_draft_part, lower_context)
+        lower_residual = self.lower_refiner(lower_draft_part, lower_context, C_lower)
         refined_lower_part = lower_draft_part + lower_residual
         pose_after_lower = self._update_pose_part(pose_after_torso, refined_lower_part, 'lower')
 
@@ -183,7 +186,7 @@ class HMDIMUModel(nn.Module):
         upper_draft_part = self._get_pose_part(pose_after_lower, 'upper')
         refined_lower_part_from_after_lower = self._get_pose_part(pose_after_lower, 'lower')
         upper_context = torch.cat([features_flat, refined_torso_part, refined_lower_part_from_after_lower], dim=1)
-        upper_residual = self.upper_refiner(upper_draft_part, upper_context)
+        upper_residual = self.upper_refiner(upper_draft_part, upper_context, C_upper)
         refined_upper_part = upper_draft_part + upper_residual
         refined_pose_flat = self._update_pose_part(pose_after_lower, refined_upper_part, 'upper')
         # --- 修改结束 ---

@@ -15,13 +15,19 @@ def train_loop(configs, device, model, loss_func, optimizer, \
     global_step = 0
     best_train_loss, best_test_loss, best_position, best_local_pose = float("inf"), float("inf"), float("inf"), float(
         "inf")
+
+    # 定义身体部位的关节索引 - 这些索引应该与model中定义的相匹配
+    torso_joints = [0, 1, 2, 3, 6, 9, 12, 13, 14, 15]  # 骨盆, 3個脊柱, 3個脖子/頭部
+    upper_body_joints = [16, 17, 18, 19, 20, 21]  # 左右肩、肘、腕
+    lower_body_joints = [4, 5, 7, 8, 10, 11]  # 左右臀、膝、踝
+
     for epoch in range(configs.train_config.epochs):
         model.train()
         current_lr = optimizer.param_groups[0]['lr']
         LOG.info(f'Training epoch: {epoch + 1}/{configs.train_config.epochs}, LR: {current_lr:.6f}')
 
         one_epoch_root_loss, one_epoch_lpose_loss, one_epoch_gpose_loss, one_epoch_joint_loss, \
-            one_epoch_acc_loss, one_epoch_shape_loss, one_epoch_total_loss, one_epoch_msgn_loss = [], [], [], [], [], [], [], []
+            one_epoch_acc_loss, one_epoch_shape_loss, one_epoch_total_loss = [], [], [], [], [], [], []
         for batch_idx, (input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas, raw_imu) in enumerate(
                 train_loader):
             global_step += 1
@@ -59,41 +65,6 @@ def train_loop(configs, device, model, loss_func, optimizer, \
             alpha = 0.3  # 这是一个超参数，您可以根据实验效果调整
             total_loss = total_loss_main + alpha * loss_draft
 
-            # --- 新增 MSGN 辅助损失计算 ---
-            # --- 新增 MSGN 辅助损失计算 ---
-            loss_msgn = 0.0
-            if gate_signals is not None:
-                # 1. 创建伪标签 (pseudo label)
-                # 我们用真实姿态在时间上的速度作为运动状态的衡量标准
-                # 速度越大，我们期望门控信号越接近1
-                gt_pose_velocity = torch.linalg.norm(gt_local_pose[:, 1:] - gt_local_pose[:, :-1], dim=-1)
-
-                # 将速度归一化到0-1之间，作为伪标签。这里使用一个简单的缩放+sigmoid
-                # 重要修复：确保形状匹配
-                pseudo_gate_label = torch.sigmoid(
-                    (gt_pose_velocity - gt_pose_velocity.mean()) / (gt_pose_velocity.std() + 1e-8))
-
-                # 我们需要为3个身体部位都创建这个标签，简单起见先直接复制
-                # 注意确保形状正确 [B, T-1, 3]
-                pseudo_gate_label = pseudo_gate_label.unsqueeze(-1).repeat(1, 1, 3)
-
-                # 确保gate_signals和pseudo_gate_label有相同的时间维度长度
-                # 修复：查看两个张量的实际形状并截取合适的部分
-                time_len = min(gate_signals.shape[1] - 1, pseudo_gate_label.shape[1])
-
-                # 2. 计算MSE损失
-                # 注意对齐时间维度
-                loss_msgn = torch.nn.functional.mse_loss(
-                    gate_signals[:, :time_len, :],  # 使用公共长度
-                    pseudo_gate_label[:, :time_len, :]  # 使用公共长度
-                )
-
-                # 3. 将MSGN损失加入总损失
-                beta = 0.1  # MSGN损失的权重，可调
-                total_loss = total_loss + beta * loss_msgn
-
-            # --- 辅助损失计算结束 ---
-
             # loss是l1损失
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(
@@ -111,7 +82,6 @@ def train_loop(configs, device, model, loss_func, optimizer, \
             one_epoch_acc_loss.append(accel_loss.item())
             one_epoch_shape_loss.append(shape_loss.item())
             one_epoch_total_loss.append(total_loss.item())
-            one_epoch_msgn_loss.append(loss_msgn.item() if isinstance(loss_msgn, torch.Tensor) else loss_msgn)
             batch_time = time.time() - batch_start
 
             if batch_idx % configs.train_config.log_interval == 0:
@@ -127,8 +97,7 @@ def train_loop(configs, device, model, loss_func, optimizer, \
                     'joint_3d_loss': round(float(joint_position_loss.item()), 3),
                     'smooth_loss': round(float(accel_loss.item()), 3),
                     'shape_loss': round(float(shape_loss.item()), 3),
-                    'loss_draft': round(float(loss_draft.item()), 3),
-                    'loss_msgn': round(float(loss_msgn.item() if isinstance(loss_msgn, torch.Tensor) else loss_msgn), 3)
+                    'loss_draft': round(float(loss_draft.item()), 3)
                 }
                 LOG.info(batch_info)
 
@@ -139,7 +108,6 @@ def train_loop(configs, device, model, loss_func, optimizer, \
         one_epoch_acc_loss = torch.tensor(one_epoch_acc_loss).mean().item()
         one_epoch_shape_loss = torch.tensor(one_epoch_shape_loss).mean().item()
         one_epoch_total_loss = torch.tensor(one_epoch_total_loss).mean().item()
-        one_epoch_msgn_loss = torch.tensor(one_epoch_msgn_loss).mean().item()
 
         train_summary_writer.add_scalar(
             'train_epoch_loss/loss_total', one_epoch_total_loss, epoch)
@@ -155,8 +123,6 @@ def train_loop(configs, device, model, loss_func, optimizer, \
             'train_epoch_loss/smooth_loss', one_epoch_acc_loss, epoch)
         train_summary_writer.add_scalar(
             'train_epoch_loss/shape_loss', one_epoch_shape_loss, epoch)
-        train_summary_writer.add_scalar(
-            'train_epoch_loss/msgn_loss', one_epoch_msgn_loss, epoch)
 
         epoch_info = {
             'type': 'train',
@@ -167,8 +133,7 @@ def train_loop(configs, device, model, loss_func, optimizer, \
             'global_pose_loss': round(float(one_epoch_gpose_loss), 3),
             'joint_3d_loss': round(float(one_epoch_joint_loss), 3),
             'smooth_loss': round(float(one_epoch_acc_loss), 3),
-            'shape_loss': round(float(one_epoch_shape_loss), 3),
-            'msgn_loss': round(float(one_epoch_msgn_loss), 3)
+            'shape_loss': round(float(one_epoch_shape_loss), 3)
         }
         LOG.info(epoch_info)
 

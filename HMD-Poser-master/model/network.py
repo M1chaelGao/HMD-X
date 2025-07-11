@@ -191,3 +191,70 @@ class CnnMSGN(nn.Module):
 
         # Return gating signals with shape [Batch, SeqLen, 3]
         return gate_signals
+
+
+class MoEHead(nn.Module):
+    """
+    基于混合专家模型（Mixture-of-Experts）的头部网络，用于根据运动状态动态混合静态和动态专家的输出。
+
+    Args:
+        pose_part_dim (int): 姿态部分的维度
+        feature_dim (int): 特征维度
+        hidden_dim (int, optional): 隐藏层维度，默认为256
+    """
+
+    def __init__(self, pose_part_dim, feature_dim, hidden_dim=256):
+        super().__init__()
+
+        # 实例化两个ContextualRefiner作为专家
+        self.static_expert = ContextualRefiner(
+            pose_part_dim=pose_part_dim,
+            feature_dim=feature_dim,
+            hidden_dim=hidden_dim
+        )
+
+        self.dynamic_expert = ContextualRefiner(
+            pose_part_dim=pose_part_dim,
+            feature_dim=feature_dim,
+            hidden_dim=hidden_dim
+        )
+
+    def forward(self, pose_part_flat, context_flat, gate_signal):
+        """
+        根据门控信号混合静态和动态专家的输出。
+
+        Args:
+            pose_part_flat (torch.Tensor): 姿态部分的平坦张量，形状为 [B*T, D_pose]
+            context_flat (torch.Tensor): 上下文特征的平坦张量，形状为 [B*T, D_context]
+            gate_signal (torch.Tensor): 门控信号，形状为 [B, T, 1] 或 [B*T, 1]
+
+        Returns:
+            torch.Tensor: 混合后的最终残差，形状与 pose_part_flat 相同
+        """
+        # 获取静态专家的残差
+        static_residual = self.static_expert(pose_part_flat, context_flat)
+
+        # 获取动态专家的残差
+        dynamic_residual = self.dynamic_expert(pose_part_flat, context_flat)
+
+        # 确保门控信号的形状与残差相匹配
+        # gate_signal形状为[B, T, 1]，需要展平为[B*T, 1]
+        if len(gate_signal.shape) == 3:
+            B, T, _ = gate_signal.shape
+            gate_signal = gate_signal.reshape(B * T, 1)
+
+        # 确保门控信号与残差在所有维度上能够广播
+        # 残差形状为[B*T, D_pose]，门控信号需要扩展为[B*T, 1]
+        if gate_signal.shape[0] != static_residual.shape[0]:
+            raise ValueError(
+                f"Gate signal batch size ({gate_signal.shape[0]}) does not match residual batch size ({static_residual.shape[0]})")
+
+        # 确保门控信号可以广播到残差的所有维度
+        if len(gate_signal.shape) == 2 and gate_signal.shape[1] == 1:
+            # 广播gate_signal使其可以与residual相乘 [B*T, 1] -> 可以广播到 [B*T, D_pose]
+            final_residual = (gate_signal * dynamic_residual) + ((1.0 - gate_signal) * static_residual)
+        else:
+            raise ValueError(
+                f"Gate signal shape {gate_signal.shape} cannot be broadcasted to residual shape {static_residual.shape}")
+
+        return final_residual

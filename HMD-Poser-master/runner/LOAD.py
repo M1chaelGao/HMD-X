@@ -1,237 +1,101 @@
-import torch
-import os
-import time
-from tqdm import tqdm
 import numpy as np
-from utils import utils_transform
-from torch.profiler import profile, record_function, ProfilerActivity
-import math
+import torch
+import matplotlib.pyplot as plt
+from scipy import signal
 
-RADIANS_TO_DEGREES = 360.0 / (2 * math.pi)
-METERS_TO_CENTIMETERS = 100.0
+# 全局参数设置
+SAMPLING_RATE = 60  # 假设IMU数据采样率为60Hz
+BREATHING_BAND = [0.2, 0.5]  # 呼吸频率范围(Hz)
+HEARTBEAT_BAND = [1.0, 2.5]  # 心跳频率范围(Hz)
 
 
-def train_loop(configs, device, model, loss_func, optimizer, \
-               lr_scheduler, train_loader, test_loader, LOG, train_summary_writer, out_dir):
-    global_step = 0
-    best_train_loss, best_test_loss, best_position, best_local_pose = float("inf"), float("inf"), float("inf"), float(
-        "inf")
-    for epoch in range(configs.train_config.epochs):
-        model.train()
-        current_lr = optimizer.param_groups[0]['lr']
-        LOG.info(f'Training epoch: {epoch + 1}/{configs.train_config.epochs}, LR: {current_lr:.6f}')
+def load_imu_data(sequence_length, noise_level):
+    """
+    模拟从AMASS数据集加载IMU数据
 
-        one_epoch_root_loss, one_epoch_lpose_loss, one_epoch_gpose_loss, one_epoch_joint_loss, \
-            one_epoch_acc_loss, one_epoch_shape_loss, one_epoch_total_loss = [], [], [], [], [], [], []
-        for batch_idx, (input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas) in enumerate(train_loader):
-            global_step += 1
-            optimizer.zero_grad()
-            batch_start = time.time()
-            input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas = input_feat.to(device).float(), \
-                gt_local_pose.to(device).float(), gt_global_pose.to(device).float(), \
-                gt_positions.to(device).float(), gt_betas.to(device).float()
-            if len(input_feat.shape) == 4:
-                input_feat = torch.flatten(input_feat, start_dim=0, end_dim=1)  # （256,3,40,135）-》（768,40,135） 3种模态的输入
-                gt_local_pose = torch.flatten(gt_local_pose, start_dim=0, end_dim=1)
-                gt_global_pose = torch.flatten(gt_global_pose, start_dim=0, end_dim=1)
-                gt_positions = torch.flatten(gt_positions, start_dim=0, end_dim=1)
-                gt_betas = torch.flatten(gt_betas, start_dim=0, end_dim=1)
+    参数:
+    sequence_length (int): 序列长度（帧数）
+    noise_level (float): 噪声水平
 
-            pred_local_pose, pred_betas, rotation_global_r6d, pred_joint_position = model(input_feat)  # ！！！！！！
-            pred_joint_position_head_centered = pred_joint_position - pred_joint_position[:, :, 15:16] + gt_positions[:,
-                                                                                                         :,
-                                                                                                         15:16]  # 把输入的头部位置作为最终的
-            gt_positions_head_centered = gt_positions
-            root_orientation_loss, local_pose_loss, global_pose_loss, joint_position_loss, accel_loss, shape_loss, total_loss = \
-                loss_func(pred_local_pose[:, :, :6], pred_local_pose[:, :, 6:], rotation_global_r6d,
-                          pred_joint_position_head_centered, pred_betas, \
-                          gt_local_pose[:, :, :6], gt_local_pose[:, :, 6:], gt_global_pose, gt_positions_head_centered,
-                          gt_betas)
-            # loss是l1损失
-            total_loss.backward()
-            optimizer.step()
-            lr_scheduler.step()
-            lr = optimizer.param_groups[0]['lr']
+    返回:
+    torch.Tensor: 模拟的单轴加速度信号
+    """
+    # 创建时间轴
+    t = torch.linspace(0, sequence_length / SAMPLING_RATE, sequence_length)
 
-            one_epoch_root_loss.append(root_orientation_loss.item())
-            one_epoch_lpose_loss.append(local_pose_loss.item())
-            one_epoch_gpose_loss.append(global_pose_loss.item())
-            one_epoch_joint_loss.append(joint_position_loss.item())
-            one_epoch_acc_loss.append(accel_loss.item())
-            one_epoch_shape_loss.append(shape_loss.item())
-            one_epoch_total_loss.append(total_loss.item())
-            batch_time = time.time() - batch_start
+    # 生成模拟的呼吸信号 (0.3Hz)
+    breathing_signal = 0.01 * torch.sin(2 * torch.pi * 0.3 * t)
 
-            if batch_idx % configs.train_config.log_interval == 0:
-                batch_info = {
-                    'type': 'train',
-                    'epoch': epoch + 1, 'batch': batch_idx, 'n_batches': len(train_loader),
-                    'time': round(batch_time, 5),
-                    'lr': round(lr, 8),
-                    'loss_total': round(float(total_loss.item()), 3),
-                    'root_orientation_loss': round(float(root_orientation_loss.item()), 3),
-                    'local_pose_loss': round(float(local_pose_loss.item()), 3),
-                    'global_pose_loss': round(float(global_pose_loss.item()), 3),
-                    'joint_3d_loss': round(float(joint_position_loss.item()), 3),
-                    'smooth_loss': round(float(accel_loss.item()), 3),
-                    'shape_loss': round(float(shape_loss.item()), 3)
-                }
-                LOG.info(batch_info)
-        one_epoch_root_loss = torch.tensor(one_epoch_root_loss).mean().item()
-        one_epoch_lpose_loss = torch.tensor(one_epoch_lpose_loss).mean().item()
-        one_epoch_gpose_loss = torch.tensor(one_epoch_gpose_loss).mean().item()
-        one_epoch_joint_loss = torch.tensor(one_epoch_joint_loss).mean().item()
-        one_epoch_acc_loss = torch.tensor(one_epoch_acc_loss).mean().item()
-        one_epoch_shape_loss = torch.tensor(one_epoch_shape_loss).mean().item()
-        one_epoch_total_loss = torch.tensor(one_epoch_total_loss).mean().item()
+    # 生成模拟的心跳信号 (1.5Hz)
+    heartbeat_signal = 0.005 * torch.sin(2 * torch.pi * 1.5 * t)
 
-        train_summary_writer.add_scalar(
-            'train_epoch_loss/loss_total', one_epoch_total_loss, epoch)
-        train_summary_writer.add_scalar(
-            'train_epoch_loss/root_orientation_loss', one_epoch_root_loss, epoch)
-        train_summary_writer.add_scalar(
-            'train_epoch_loss/local_pose_loss', one_epoch_lpose_loss, epoch)
-        train_summary_writer.add_scalar(
-            'train_epoch_loss/global_pose_loss', one_epoch_gpose_loss, epoch)
-        train_summary_writer.add_scalar(
-            'train_epoch_loss/joint_3d_loss', one_epoch_joint_loss, epoch)
-        train_summary_writer.add_scalar(
-            'train_epoch_loss/smooth_loss', one_epoch_acc_loss, epoch)
-        train_summary_writer.add_scalar(
-            'train_epoch_loss/shape_loss', one_epoch_shape_loss, epoch)
+    # 生成模拟的运动噪声
+    motion_noise = torch.randn(sequence_length) * noise_level
 
-        epoch_info = {
-            'type': 'train',
-            'epoch': epoch + 1,
-            'loss_total': round(float(one_epoch_total_loss), 3),
-            'root_orientation_loss': round(float(one_epoch_root_loss), 3),
-            'local_pose_loss': round(float(one_epoch_lpose_loss), 3),
-            'global_pose_loss': round(float(one_epoch_gpose_loss), 3),
-            'joint_3d_loss': round(float(one_epoch_joint_loss), 3),
-            'smooth_loss': round(float(one_epoch_acc_loss), 3),
-            'shape_loss': round(float(one_epoch_shape_loss), 3)
-        }
-        LOG.info(epoch_info)
+    # 组合信号
+    accel_y = breathing_signal + heartbeat_signal + motion_noise
 
-        if one_epoch_total_loss < best_train_loss:
-            LOG.info("Saving model with best train loss in epoch {}".format(epoch + 1))
-            filename = os.path.join(out_dir, "epoch_with_best_trainloss.pt")
-            if os.path.exists(filename):
-                os.remove(filename)
-            model.save(epoch, filename)
-            best_train_loss = one_epoch_total_loss
+    return accel_y
 
-        if epoch % configs.train_config.val_interval == 0:
-            model.eval()
-            one_epoch_root_loss, one_epoch_lpose_loss, one_epoch_gpose_loss, one_epoch_joint_loss, \
-                one_epoch_acc_loss, one_epoch_shape_loss, one_epoch_total_loss = [], [], [], [], [], [], []
-            position_error_, local_pose_error_ = [], []
-            with torch.no_grad():
-                for _, (input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas) in tqdm(
-                        enumerate(test_loader)):
-                    input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas = input_feat.to(device).float(), \
-                        gt_local_pose.to(device).float(), gt_global_pose.to(device).float(), \
-                        gt_positions.to(device).float(), gt_betas.to(device).float()
-                    if len(input_feat.shape) == 4:
-                        input_feat = torch.flatten(input_feat, start_dim=0, end_dim=1)
-                        gt_local_pose = torch.flatten(gt_local_pose, start_dim=0, end_dim=1)
-                        gt_global_pose = torch.flatten(gt_global_pose, start_dim=0, end_dim=1)
-                        gt_positions = torch.flatten(gt_positions, start_dim=0, end_dim=1)
-                        gt_betas = torch.flatten(gt_betas, start_dim=0, end_dim=1)
 
-                    pred_local_pose, pred_betas, rotation_global_r6d, pred_joint_position = model(input_feat)
+def plot_spectrum(signal, title):
+    """
+    计算并绘制信号的频谱
 
-                    pred_joint_position_head_centered = pred_joint_position - pred_joint_position[:, :,
-                                                                              15:16] + gt_positions[:, :, 15:16]
-                    gt_positions_head_centered = gt_positions
-                    root_orientation_loss, local_pose_loss, global_pose_loss, joint_position_loss, accel_loss, shape_loss, total_loss = \
-                        loss_func(pred_local_pose[:, :, :6], pred_local_pose[:, :, 6:], rotation_global_r6d,
-                                  pred_joint_position_head_centered, pred_betas, \
-                                  gt_local_pose[:, :, :6], gt_local_pose[:, :, 6:], gt_global_pose,
-                                  gt_positions_head_centered, gt_betas)
+    参数:
+    signal (torch.Tensor): 输入信号
+    title (str): 图表标题
+    """
+    # 计算信号长度
+    N = len(signal)
 
-                    pos_error_ = torch.mean(torch.sqrt(
-                        torch.sum(
-                            torch.square(gt_positions_head_centered - pred_joint_position_head_centered), axis=-1
-                        )
-                    ))
-                    position_error_.append(pos_error_.item() * METERS_TO_CENTIMETERS)
+    # 执行FFT
+    fft_vals = torch.fft.fft(signal)
 
-                    pred_local_pose_aa = utils_transform.sixd2aa(pred_local_pose.reshape(-1, 6).detach()).reshape(-1,
-                                                                                                                  22 * 3)
-                    gt_local_pose_aa = utils_transform.sixd2aa(gt_local_pose.reshape(-1, 6).detach()).reshape(-1,
-                                                                                                              22 * 3)
-                    diff = gt_local_pose_aa - pred_local_pose_aa
-                    diff[diff > np.pi] = diff[diff > np.pi] - 2 * np.pi
-                    diff[diff < -np.pi] = diff[diff < -np.pi] + 2 * np.pi
-                    rot_error = torch.mean(torch.absolute(diff))
-                    local_pose_error_.append(rot_error.item() * RADIANS_TO_DEGREES)
+    # 计算频率轴
+    fft_freq = torch.fft.fftfreq(N, 1.0 / SAMPLING_RATE)
 
-                    one_epoch_root_loss.append(root_orientation_loss.item())
-                    one_epoch_lpose_loss.append(local_pose_loss.item())
-                    one_epoch_gpose_loss.append(global_pose_loss.item())
-                    one_epoch_joint_loss.append(joint_position_loss.item())
-                    one_epoch_acc_loss.append(accel_loss.item())
-                    one_epoch_shape_loss.append(shape_loss.item())
-                    one_epoch_total_loss.append(total_loss.item())
+    # 计算频谱幅度
+    fft_magnitude = torch.abs(fft_vals)
 
-            one_epoch_root_loss = torch.tensor(one_epoch_root_loss).mean().item()
-            one_epoch_lpose_loss = torch.tensor(one_epoch_lpose_loss).mean().item()
-            one_epoch_gpose_loss = torch.tensor(one_epoch_gpose_loss).mean().item()
-            one_epoch_joint_loss = torch.tensor(one_epoch_joint_loss).mean().item()
-            one_epoch_acc_loss = torch.tensor(one_epoch_acc_loss).mean().item()
-            one_epoch_shape_loss = torch.tensor(one_epoch_shape_loss).mean().item()
-            one_epoch_total_loss = torch.tensor(one_epoch_total_loss).mean().item()
-            position_error_ = torch.tensor(position_error_).mean().item()
-            local_pose_error_ = torch.tensor(local_pose_error_).mean().item()
+    # 找到正频率的索引
+    positive_freq_indices = fft_freq > 0
 
-            train_summary_writer.add_scalar(
-                'val_epoch_loss/loss_total', one_epoch_total_loss, epoch)
-            train_summary_writer.add_scalar(
-                'val_epoch_loss/root_orientation_loss', one_epoch_root_loss, epoch)
-            train_summary_writer.add_scalar(
-                'val_epoch_loss/local_pose_loss', one_epoch_lpose_loss, epoch)
-            train_summary_writer.add_scalar(
-                'val_epoch_loss/global_pose_loss', one_epoch_gpose_loss, epoch)
-            train_summary_writer.add_scalar(
-                'val_epoch_loss/joint_3d_loss', one_epoch_joint_loss, epoch)
-            train_summary_writer.add_scalar(
-                'val_epoch_loss/smooth_loss', one_epoch_acc_loss, epoch)
-            train_summary_writer.add_scalar(
-                'val_epoch_loss/shape_loss', one_epoch_shape_loss, epoch)
-            train_summary_writer.add_scalar(
-                'val_epoch_loss/position_error', position_error_, epoch)
-            train_summary_writer.add_scalar(
-                'val_epoch_loss/local_pose_error', local_pose_error_, epoch)
+    # 绘制频谱
+    plt.plot(fft_freq[positive_freq_indices], fft_magnitude[positive_freq_indices], label="Signal Spectrum")
 
-            epoch_info = {
-                'type': 'test',
-                'epoch': epoch + 1,
-                'loss_total': round(float(one_epoch_total_loss), 3),
-                'root_orientation_loss': round(float(one_epoch_root_loss), 3),
-                'local_pose_loss': round(float(one_epoch_lpose_loss), 3),
-                'global_pose_loss': round(float(one_epoch_gpose_loss), 3),
-                'joint_3d_loss': round(float(one_epoch_joint_loss), 3),
-                'smooth_loss': round(float(one_epoch_acc_loss), 3),
-                'shape_loss': round(float(one_epoch_shape_loss), 3),
-                'MPJPE': round(float(position_error_), 3),
-                'MPJRE_with_Root': round(float(local_pose_error_), 3)
-            }
-            LOG.info(epoch_info)
-            model.train()
+    # 标记呼吸频带
+    plt.axvline(BREATHING_BAND[0], color='r', linestyle='--', alpha=0.7)
+    plt.axvline(BREATHING_BAND[1], color='r', linestyle='--', alpha=0.7)
+    plt.axvspan(BREATHING_BAND[0], BREATHING_BAND[1], alpha=0.2, color='r', label="Breathing Band")
 
-            if one_epoch_total_loss < best_test_loss:
-                LOG.info("Saving model with lowest test loss in epoch {}".format(epoch + 1))
-                filename = os.path.join(out_dir, "epoch_with_best_testloss.pt")
-                if os.path.exists(filename):
-                    os.remove(filename)
-                model.save(epoch, filename)
-                best_test_loss = one_epoch_total_loss
+    # 标记心跳频带
+    plt.axvline(HEARTBEAT_BAND[0], color='g', linestyle='--', alpha=0.7)
+    plt.axvline(HEARTBEAT_BAND[1], color='g', linestyle='--', alpha=0.7)
+    plt.axvspan(HEARTBEAT_BAND[0], HEARTBEAT_BAND[1], alpha=0.2, color='g', label="Heartbeat Band")
 
-            if position_error_ < best_position:
-                best_position = position_error_
-                LOG.info("Lowest MPJPE {} in epoch {}".format(best_position, epoch + 1))
+    # 设置图表属性
+    plt.xlabel("Frequency (Hz)")
+    plt.ylabel("Magnitude")
+    plt.title(title)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
 
-            if local_pose_error_ < best_local_pose:
-                best_local_pose = local_pose_error_
-                LOG.info("Lowest MPJRE_(including root) {} in epoch {}".format(best_local_pose, epoch + 1))
+
+if __name__ == "__main__":
+    # 设置图表大小
+    plt.figure(figsize=(20, 10))
+
+    # 生成并分析"静止"场景的信号
+    static_signal = load_imu_data(sequence_length=3000, noise_level=0.001)
+    plt.subplot(2, 1, 1)
+    plot_spectrum(static_signal, "Spectrum of 'Static' Scenario (Low Noise)")
+
+    # 生成并分析"运动"场景的信号
+    motion_signal = load_imu_data(sequence_length=3000, noise_level=0.05)
+    plt.subplot(2, 1, 2)
+    plot_spectrum(motion_signal, "Spectrum of 'Motion' Scenario (High Noise)")
+
+    # 调整布局并显示
+    plt.tight_layout()
+    plt.show()

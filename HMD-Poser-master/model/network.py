@@ -150,49 +150,6 @@ class ContextualRefiner(nn.Module):
         return self.network(combined_input)
     # --- 结束替换forward方法 ---
 
-
-class CnnMSGN(nn.Module):
-    def __init__(self, input_dim=18, output_dim=3, cnn_out_channels=32, kernel_size=7):
-        super().__init__()
-        # Calculate padding to keep sequence length unchanged
-        padding = (kernel_size - 1) // 2
-
-        # CNN layer for temporal feature extraction
-        self.cnn = nn.Conv1d(
-            in_channels=input_dim,
-            out_channels=cnn_out_channels,
-            kernel_size=kernel_size,
-            padding=padding
-        )
-
-        # Fully connected layers for gating signal generation
-        self.fc = nn.Sequential(
-            nn.Linear(cnn_out_channels, 64),
-            nn.ReLU(),
-            nn.Linear(64, output_dim)
-        )
-
-    def forward(self, raw_imu_sequence):
-        # Input shape: [Batch, SeqLen, 18]
-        # Reshape for Conv1d: [Batch, 18, SeqLen]
-        x = raw_imu_sequence.permute(0, 2, 1)
-
-        # Apply CNN and ReLU activation
-        x = F.relu(self.cnn(x))
-
-        # Reshape back: [Batch, SeqLen, cnn_out_channels]
-        x = x.permute(0, 2, 1)
-
-        # Apply fully connected layers to get logits
-        logits = self.fc(x)
-
-        # Apply sigmoid to get gating signals
-        gate_signals = torch.sigmoid(logits)
-
-        # Return gating signals with shape [Batch, SeqLen, 3]
-        return gate_signals
-
-
 class MoEHead(nn.Module):
     """
     基于混合专家模型（Mixture-of-Experts）的头部网络，用于根据运动状态动态混合静态和动态专家的输出。
@@ -258,3 +215,52 @@ class MoEHead(nn.Module):
                 f"Gate signal shape {gate_signal.shape} cannot be broadcasted to residual shape {static_residual.shape}")
 
         return final_residual
+
+
+class GruMSGN(nn.Module):
+    """
+    基于双向GRU的运动状态门控网络 (Motion State Gating Network)
+
+    Args:
+        input_dim (int): 输入IMU数据的维度，默认为18
+        output_dim (int): 输出门控信号的维度，默认为3
+        hidden_dim (int): GRU隐藏层的维度，默认为64
+        n_layers (int): GRU的层数，默认为2
+    """
+
+    def __init__(self, input_dim=18, output_dim=3, hidden_dim=64, n_layers=2):
+        super().__init__()
+
+        # 设置双向GRU层
+        self.gru = nn.GRU(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
+            num_layers=n_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.1 if n_layers > 1 else 0
+        )
+
+        # 设置全连接层，注意因为GRU是双向的，所以输入维度是hidden_dim*2
+        self.fc = nn.Linear(hidden_dim * 2, output_dim)
+
+    def forward(self, raw_imu_sequence):
+        """
+        处理原始IMU序列并生成门控信号
+
+        Args:
+            raw_imu_sequence (torch.Tensor): 原始IMU数据，形状为 [Batch, SeqLen, 18]
+
+        Returns:
+            torch.Tensor: 门控信号，形状为 [Batch, SeqLen, 3]
+        """
+        # 将IMU序列送入GRU
+        gru_out, _ = self.gru(raw_imu_sequence)
+
+        # 将GRU输出送入全连接层
+        logits = self.fc(gru_out)
+
+        # 使用sigmoid激活函数生成0-1范围内的门控信号
+        gate_signals = torch.sigmoid(logits)
+
+        return gate_signals

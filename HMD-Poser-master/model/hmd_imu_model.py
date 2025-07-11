@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from model.network import HMD_imu_HME_Universe, CnnMSGN
+from model.network import HMD_imu_HME_Universe, GruMSGN
 from utils import utils_transform
 from human_body_prior.body_model.body_model import BodyModel
 import os
@@ -78,8 +78,8 @@ class HMDIMUModel(nn.Module):
             hidden_dim=256
         ).to(device)
 
-        # --- 新增MSGN实例化 ---
-        self.msgn = CnnMSGN(input_dim=18, output_dim=3).to(device)
+        # --- 修改MSGN实例化，将CnnMSGN替换为GruMSGN ---
+        self.msgn = GruMSGN(input_dim=18, output_dim=3, hidden_dim=64, n_layers=2).to(device)
 
     def forward_kinematics_R(self, R_local: torch.Tensor, parent):
         R_local = R_local.view(R_local.shape[0], -1, 3, 3)
@@ -159,7 +159,7 @@ class HMDIMUModel(nn.Module):
         # --- 2. 新增：计算门控信号 ---
         gate_signals = None
         if raw_imu is not None:
-            # raw_imu 的形状是 [B, T, 18]，正是CnnMSGN期望的
+            # raw_imu 的形状是 [B, T, 18]，正是GruMSGN期望的
             gate_signals = self.msgn(raw_imu)
 
         # 切片门控信号，为三个部位各提取一个通道

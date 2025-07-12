@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 from model.hmd_imu_model import HMDIMUModel
 from model.loss import PoseJointLoss
 from runner.training_loop import train_loop
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str,  help="Path, where config file is stored")

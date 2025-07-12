@@ -62,7 +62,7 @@ def train_loop(configs, device, model, loss_func, optimizer, \
             #    注意：这里的gt_local_pose是和pose_draft维度完全匹配的真值
             loss_draft = torch.nn.functional.l1_loss(pose_draft, gt_local_pose)
             # 3. 合并成最终的总损失
-            alpha = 0.3  # 这是一个超参数，您可以根据实验效果调整
+            alpha = 0.1  # 这是一个超参数，您可以根据实验效果调整
             total_loss = total_loss_main + alpha * loss_draft
 
             # loss是l1损失

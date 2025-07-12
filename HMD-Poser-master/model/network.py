@@ -163,13 +163,12 @@ class MoEHead(nn.Module):
     def __init__(self, pose_part_dim, feature_dim, hidden_dim=256):
         super().__init__()
 
-        # 实例化两个ContextualRefiner作为专家
+        # 都用ContextualRefiner，static expert变为能力强的“静态专家”
         self.static_expert = ContextualRefiner(
             pose_part_dim=pose_part_dim,
             feature_dim=feature_dim,
             hidden_dim=hidden_dim
         )
-
         self.dynamic_expert = ContextualRefiner(
             pose_part_dim=pose_part_dim,
             feature_dim=feature_dim,

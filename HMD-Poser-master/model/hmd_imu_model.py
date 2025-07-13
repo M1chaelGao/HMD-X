@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from model.network import HMD_imu_HME_Universe
+from model.network import HMD_imu_HME_Universe, UnifiedRefiner
 from utils import utils_transform
 from human_body_prior.body_model.body_model import BodyModel
 import os
@@ -12,35 +12,11 @@ model_wraps = {
 }
 
 def forward_kinematics_R(R_local: torch.Tensor, parent):
-    r"""
-    :math:`R_global = FK(R_local)`
-
-    Forward kinematics that computes the global rotation of each joint from local rotations. (torch, batch)
-
-    Notes
-    -----
-    A joint's *local* rotation is expressed in its parent's frame.
-
-    A joint's *global* rotation is expressed in the base (root's parent) frame.
-
-    R_local[:, i], parent[i] should be the local rotation and parent joint id of
-    joint i. parent[i] must be smaller than i for any i > 0.
-
-    Args
-    -----
-    :param R_local: Joint local rotation tensor in shape [batch_size, *] that can reshape to
-                    [batch_size, num_joint, 3, 3] (rotation matrices).
-    :param parent: Parent joint id list in shape [num_joint]. Use -1 or None for base id (parent[0]).
-    :return: Joint global rotation, in shape [batch_size, num_joint, 3, 3].
-    """
     R_local = R_local.view(R_local.shape[0], -1, 3, 3)
     R_global = _forward_tree(R_local, parent, torch.bmm)
     return R_global
 
 def _forward_tree(x_local: torch.Tensor, parent, reduction_fn):
-    r"""
-    Multiply/Add matrices along the tree branches. x_local [N, J, *]. parent [J].
-    """
     x_global = [x_local[:, 0]]
     for i in range(1, len(parent)):
         x_global.append(reduction_fn(x_global[parent[i]], x_local[:, i]))
@@ -51,13 +27,21 @@ class HMDIMUModel(nn.Module):
     def __init__(self, configs, device):
         super().__init__()
         self.netG = model_wraps[configs.model_name](
-            configs.sparse_dim, 
-            configs.model_params.number_layer, 
-            configs.model_params.hidden_size, 
+            configs.sparse_dim,
+            configs.model_params.number_layer,
+            configs.model_params.hidden_size,
             configs.model_params.dropout,
             configs.model_params.nhead,
             configs.model_params.block_num
             ).to(device)
+        hidden_size = configs.model_params.hidden_size
+        aggregated_feature_dim = hidden_size * 6
+        self.refiner = UnifiedRefiner(
+            feature_dim=aggregated_feature_dim,
+            pose_dim=22*6,
+            hidden_dim=512
+        ).to(device)
+
         support_dir = configs.support_dir
         subject_gender = "neutral"
         bm_fname = os.path.join(support_dir, 'smplh/{}/model.npz'.format(subject_gender))
@@ -78,56 +62,31 @@ class HMDIMUModel(nn.Module):
         return joint_position
 
     def get_bare_model(self, network):
-        """Get bare model, especially under wrapping with
-        DistributedDataParallel or DataParallel.
-        """
         if isinstance(network, (DataParallel, DistributedDataParallel)):
             network = network.module
         return network
 
     def _controlled_fk(self, global_orientation, joint_rotation, body_shape, chunk_size=512):
         full_size = global_orientation.shape[0]
-
         if full_size <= chunk_size:
             return self.fk_module(global_orientation, joint_rotation, body_shape)
-
         results = []
         for i in range(0, full_size, chunk_size):
             end_idx = min(i + chunk_size, full_size)
-
-            # 对每个小块独立调用原始的 fk_module
             chunk_pos = self.fk_module(
                 global_orientation[i:end_idx],
                 joint_rotation[i:end_idx],
                 body_shape[i:end_idx]
             )
             results.append(chunk_pos)
-
         return torch.cat(results, dim=0)
 
     def load_network(self, load_path, network, strict=True, param_key='state_dict'):
         network = self.get_bare_model(network)
-        if strict:
-            state_dict = torch.load(load_path)
-            if param_key in state_dict.keys():
-                state_dict = state_dict[param_key]
-            network.load_state_dict(state_dict, strict=strict)
-        else:
-            pretrained_state_dict = torch.load(load_path)
-            if param_key in pretrained_state_dict.keys():
-                pretrained_state_dict = pretrained_state_dict[param_key]
-            model_state_dict = network.state_dict()
-            new_pretrained_state_dict = {}
-            for k, v in pretrained_state_dict.items():
-                if k in model_state_dict and v.shape == model_state_dict[k].shape:
-                    new_pretrained_state_dict[k] = v
-                elif '.'.join([k.split('.')[0], k]) in model_state_dict and v.shape == model_state_dict['.'.join([k.split('.')[0], k])].shape:
-                    new_pretrained_state_dict['.'.join([k.split('.')[0], k])] = v
-            not_inited_params = set(model_state_dict.keys()) - set(new_pretrained_state_dict.keys())
-            if len(not_inited_params) > 0:
-                print("Parameters [{}] were not inited".format(not_inited_params))
-            network.load_state_dict(new_pretrained_state_dict, strict=False)
-            del pretrained_state_dict, new_pretrained_state_dict, model_state_dict
+        state_dict = torch.load(load_path)
+        if param_key in state_dict.keys():
+            state_dict = state_dict[param_key]
+        network.load_state_dict(state_dict, strict=strict)
 
     def load(self, model_path, strict=True):
         self.load_network(model_path, self.netG, strict)
@@ -139,23 +98,36 @@ class HMDIMUModel(nn.Module):
 
     def forward(self, sparse_input, do_fk=True):
         batch_size, time_length = sparse_input.shape[0], sparse_input.shape[1]
-        pred_pose, pred_shapes = self.netG(sparse_input)
+        pose_draft, pred_shapes, aggregated_features = self.netG(sparse_input, return_features=True)
+
+        fast_features = aggregated_features
+        # Downsample by stride 2 for slow features
+        slow_features = aggregated_features[:, ::2, :]
+
+        # Upsample slow features to time_length
+        # repeat_interleave: each slow frame covers 2 fast frames, so repeat 2 times
+        slow_features_upsampled = slow_features.repeat_interleave(2, dim=1)
+        # If time_length is odd, slow_features_upsampled may be longer, so truncate or pad
+        if slow_features_upsampled.shape[1] > time_length:
+            slow_features_upsampled = slow_features_upsampled[:, :time_length, :]
+        elif slow_features_upsampled.shape[1] < time_length:
+            pad_shape = (slow_features_upsampled.shape[0], time_length - slow_features_upsampled.shape[1], slow_features_upsampled.shape[2])
+            pad = torch.zeros(pad_shape, device=slow_features_upsampled.device, dtype=slow_features_upsampled.dtype)
+            slow_features_upsampled = torch.cat([slow_features_upsampled, pad], dim=1)
+
+        fused_features = fast_features + slow_features_upsampled
+        pose_residual = self.refiner(pose_draft, fused_features)
+        pred_pose = pose_draft + pose_residual
+
         rotation_local_matrot = utils_transform.sixd2matrot(pred_pose.reshape(-1, 6)).reshape(batch_size*time_length, 22, 3, 3)
         rotation_global_matrot = forward_kinematics_R(rotation_local_matrot, self.bm.kintree_table[0][:22].long()).view(batch_size, time_length, 22, 3, 3)
         rotation_global_r6d = utils_transform.matrot2sixd(rotation_global_matrot.reshape(-1, 3, 3)).reshape(batch_size, time_length, 22*6)
         if do_fk:
-            # --- 这是需要修改的地方 ---
-            # 旧的调用方式:
-            # pred_joint_position = self.fk_module(...)
-
-            # 新的、带内存控制的调用方式:
             pred_joint_position = self._controlled_fk(
                 pred_pose[:, :, :6].reshape(-1, 6),
                 pred_pose[:, :, 6:].reshape(-1, 21 * 6),
                 pred_shapes.reshape(-1, 16)
             )
-            # --- 修改结束 ---
-
             pred_joint_position = pred_joint_position.reshape(batch_size, time_length, 22, 3)
             return pred_pose, pred_shapes, rotation_global_r6d, pred_joint_position
         else:

@@ -1,7 +1,7 @@
 task: "HMD_IMU_Human_Motion_Estimation_long"
 
 model_name: "HMD_imu_HME_Universe"
-dataset_path: "/home/wh0146/HMD-Poser-master/data_over_2ear/"
+dataset_path: "/home/4T-2/gyf/ProcessedHMDdata/"
 support_dir: "./body_models/"
 resume_model: "/home/wh0146/HMD-Poser-master/experiments/HMD_IMU_Human_Motion_Estimation_longlong/2024-11-28-17-47-57/epoch_with_best_trainloss.pt"
 manual_seed: null

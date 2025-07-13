@@ -75,7 +75,8 @@ def main():
         batch_size=1,
         shuffle=False,
         num_workers=1,
-        drop_last=False
+        drop_last=False,
+        persistent_workers = True  # <-- 在这里添加 True
     )
     LOG.info("There are {} video sequence, {} item and {} batch in the test set.".format(
         len(test_datas),

@@ -85,7 +85,7 @@ class HMDIMUModel(nn.Module):
             network = network.module
         return network
 
-    def _controlled_fk(self, global_orientation, joint_rotation, body_shape, chunk_size=32):
+    def _controlled_fk(self, global_orientation, joint_rotation, body_shape, chunk_size=512):
         full_size = global_orientation.shape[0]
 
         if full_size <= chunk_size:

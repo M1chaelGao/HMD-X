@@ -20,7 +20,19 @@ def train_loop(configs, device, model, loss_func, optimizer, \
 
         one_epoch_root_loss, one_epoch_lpose_loss, one_epoch_gpose_loss, one_epoch_joint_loss, \
             one_epoch_acc_loss, one_epoch_shape_loss, one_epoch_total_loss = [], [], [], [], [], [], []
+
+        # <<< --- START OF SMOKE TEST MODIFICATION --- >>>
+        #SMOKE_TEST_ITERATIONS = 15  # We'll just run 5 batches
+        # <<< ---  END OF SMOKE TEST MODIFICATION  --- >>>
+
         for batch_idx, (input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas) in enumerate(train_loader):
+
+            # <<< --- START OF SMOKE TEST MODIFICATION --- >>>
+            #if batch_idx >= SMOKE_TEST_ITERATIONS:
+                #print(f"--- Smoke test: Train loop limited to {SMOKE_TEST_ITERATIONS} iterations. Breaking. ---")
+                #break
+            # <<< ---  END OF SMOKE TEST MODIFICATION  --- >>>
+
             global_step += 1
             optimizer.zero_grad()
             batch_start = time.time()
@@ -28,19 +40,18 @@ def train_loop(configs, device, model, loss_func, optimizer, \
                 gt_local_pose.to(device).float(), gt_global_pose.to(device).float(), \
                     gt_positions.to(device).float(), gt_betas.to(device).float()
             if len(input_feat.shape) == 4:
-                input_feat = torch.flatten(input_feat, start_dim=0, end_dim=1) # （256,3,40,135）-》（768,40,135） 3种模态的输入
+                input_feat = torch.flatten(input_feat, start_dim=0, end_dim=1)
                 gt_local_pose = torch.flatten(gt_local_pose, start_dim=0, end_dim=1)
                 gt_global_pose = torch.flatten(gt_global_pose, start_dim=0, end_dim=1)
                 gt_positions = torch.flatten(gt_positions, start_dim=0, end_dim=1)
                 gt_betas = torch.flatten(gt_betas, start_dim=0, end_dim=1)
 
-            pred_local_pose, pred_betas, rotation_global_r6d, pred_joint_position = model(input_feat) #！！！！！！
-            pred_joint_position_head_centered = pred_joint_position - pred_joint_position[:, :, 15:16] + gt_positions[:, :, 15:16]  # 把输入的头部位置作为最终的
+            pred_local_pose, pred_betas, rotation_global_r6d, pred_joint_position = model(input_feat)
+            pred_joint_position_head_centered = pred_joint_position - pred_joint_position[:, :, 15:16] + gt_positions[:, :, 15:16]
             gt_positions_head_centered = gt_positions
             root_orientation_loss, local_pose_loss, global_pose_loss, joint_position_loss, accel_loss, shape_loss, total_loss = \
                 loss_func(pred_local_pose[:, :, :6], pred_local_pose[:, :, 6:], rotation_global_r6d, pred_joint_position_head_centered, pred_betas, \
                     gt_local_pose[:, :, :6], gt_local_pose[:, :, 6:], gt_global_pose, gt_positions_head_centered, gt_betas)
-            # loss是l1损失
             total_loss.backward()
             optimizer.step()
             lr_scheduler.step()
@@ -54,7 +65,7 @@ def train_loop(configs, device, model, loss_func, optimizer, \
             one_epoch_shape_loss.append(shape_loss.item())
             one_epoch_total_loss.append(total_loss.item())
             batch_time = time.time() - batch_start
-            
+
             if batch_idx % configs.train_config.log_interval == 0:
                 batch_info = {
                     'type': 'train',
@@ -113,14 +124,21 @@ def train_loop(configs, device, model, loss_func, optimizer, \
                 os.remove(filename)
             model.save(epoch, filename)
             best_train_loss = one_epoch_total_loss
-        
+
         if epoch % configs.train_config.val_interval == 0:
             model.eval()
             one_epoch_root_loss, one_epoch_lpose_loss, one_epoch_gpose_loss, one_epoch_joint_loss, \
                 one_epoch_acc_loss, one_epoch_shape_loss, one_epoch_total_loss = [], [], [], [], [], [], []
             position_error_, local_pose_error_ = [], []
             with torch.no_grad():
-                for _, (input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas) in tqdm(enumerate(test_loader)):
+                for batch_idx_test, (input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas) in tqdm(enumerate(test_loader)):
+
+                    # <<< --- START OF SMOKE TEST MODIFICATION --- >>>
+                    #if batch_idx_test >= SMOKE_TEST_ITERATIONS:
+                        #print(f"--- Smoke test: Validation loop limited to {SMOKE_TEST_ITERATIONS} iterations. Breaking. ---")
+                        #break
+                    # <<< ---  END OF SMOKE TEST MODIFICATION  --- >>>
+
                     input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas = input_feat.to(device).float(), \
                         gt_local_pose.to(device).float(), gt_global_pose.to(device).float(), \
                             gt_positions.to(device).float(), gt_betas.to(device).float()
@@ -132,13 +150,13 @@ def train_loop(configs, device, model, loss_func, optimizer, \
                         gt_betas = torch.flatten(gt_betas, start_dim=0, end_dim=1)
 
                     pred_local_pose, pred_betas, rotation_global_r6d, pred_joint_position = model(input_feat)
-                    
+
                     pred_joint_position_head_centered = pred_joint_position - pred_joint_position[:, :, 15:16] + gt_positions[:, :, 15:16]
                     gt_positions_head_centered = gt_positions
                     root_orientation_loss, local_pose_loss, global_pose_loss, joint_position_loss, accel_loss, shape_loss, total_loss = \
                         loss_func(pred_local_pose[:, :, :6], pred_local_pose[:, :, 6:], rotation_global_r6d, pred_joint_position_head_centered, pred_betas, \
                             gt_local_pose[:, :, :6], gt_local_pose[:, :, 6:], gt_global_pose, gt_positions_head_centered, gt_betas)
-                    
+
                     pos_error_ = torch.mean(torch.sqrt(
                         torch.sum(
                             torch.square(gt_positions_head_centered-pred_joint_position_head_centered),axis=-1
@@ -161,7 +179,7 @@ def train_loop(configs, device, model, loss_func, optimizer, \
                     one_epoch_acc_loss.append(accel_loss.item())
                     one_epoch_shape_loss.append(shape_loss.item())
                     one_epoch_total_loss.append(total_loss.item())
-            
+
             one_epoch_root_loss = torch.tensor(one_epoch_root_loss).mean().item()
             one_epoch_lpose_loss = torch.tensor(one_epoch_lpose_loss).mean().item()
             one_epoch_gpose_loss = torch.tensor(one_epoch_gpose_loss).mean().item()
@@ -214,11 +232,16 @@ def train_loop(configs, device, model, loss_func, optimizer, \
                     os.remove(filename)
                 model.save(epoch, filename)
                 best_test_loss = one_epoch_total_loss
-            
+
             if position_error_ < best_position:
                 best_position = position_error_
                 LOG.info("Lowest MPJPE {} in epoch {}".format(best_position, epoch+1))
-            
+
             if local_pose_error_ < best_local_pose:
                 best_local_pose = local_pose_error_
                 LOG.info("Lowest MPJRE_(including root) {} in epoch {}".format(best_local_pose, epoch+1))
+
+        # <<< --- START OF SMOKE TEST MODIFICATION --- >>>
+        #print(f"--- Smoke test: Only running for 1 epoch. Breaking outer loop. ---")
+        #break # We only need to run one epoch for a smoke test
+        # <<< ---  END OF SMOKE TEST MODIFICATION  --- >>>

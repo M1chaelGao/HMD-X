@@ -158,12 +158,66 @@ class HMD_imu_HME_Universe(torch.nn.Module):
             )
         
     
-    def forward(self, x_in, rnn_state=None):
-        collect_feats = self.backbone(x_in, rnn_state)  # 时空特征学习
+    def forward(self, x_in, rnn_state=None, return_features=False):
+        collect_feats = self.backbone(x_in, rnn_state)
         batch_size, time_seq = x_in.shape[0], x_in.shape[1]
-        collect_feats = collect_feats.reshape(batch_size, time_seq, -1) #时空特征聚合
+        aggregated_features = collect_feats.reshape(batch_size, time_seq, -1)
 
-        pred_pose = self.pose_est(collect_feats)
-        pred_shapes = self.shape_est(collect_feats)
+        pred_pose = self.pose_est(aggregated_features)
+        pred_shapes = self.shape_est(aggregated_features)
 
-        return pred_pose, pred_shapes
+        if return_features:
+            return pred_pose, pred_shapes, aggregated_features
+        else:
+            return pred_pose, pred_shapes
+
+class ExpertRefiner(nn.Module):
+    def __init__(self, feature_dim, pose_dim, hidden_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(feature_dim + pose_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, pose_dim)
+        self.act = nn.LeakyReLU()
+
+    def forward(self, x_pose, x_features):
+        # x_pose: [B, T, pose_dim] or [B, pose_dim]
+        # x_features: [B, T, feature_dim] or [B, feature_dim]
+        x = torch.cat([x_pose, x_features], dim=-1)
+        x = self.act(self.fc1(x))
+        x = self.act(self.fc2(x))
+        residual = self.fc3(x)
+        return residual  # shape matches x_pose
+
+class MoEHead(nn.Module):
+    def __init__(self, feature_dim, pose_dim, hidden_dim):
+        super().__init__()
+        self.static_expert = ExpertRefiner(feature_dim, pose_dim, hidden_dim)
+        self.dynamic_expert = ExpertRefiner(feature_dim, pose_dim, hidden_dim)
+
+    def forward(self, pose_draft_part, context_features, gate_signal):
+        # pose_draft_part: [B, T, pose_dim]
+        # context_features: [B, T, feature_dim]
+        # gate_signal: [B, T, 1], values in [0, 1]
+        static_residual = self.static_expert(pose_draft_part, context_features)
+        dynamic_residual = self.dynamic_expert(pose_draft_part, context_features)
+        mixed_residual = gate_signal * dynamic_residual + (1 - gate_signal) * static_residual
+        return mixed_residual
+
+class GruMSGN(nn.Module):
+    def __init__(self, feature_dim, hidden_dim, num_gates=3):
+        super().__init__()
+        self.gru = nn.GRU(
+            input_size=feature_dim,
+            hidden_size=hidden_dim,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True
+        )
+        self.fc_gate = nn.Linear(hidden_dim * 2, num_gates)
+
+    def forward(self, slow_features):
+        # slow_features: [B, T_slow, feature_dim]
+        gru_out, _ = self.gru(slow_features)  # [B, T_slow, hidden_dim*2]
+        gate_logits = self.fc_gate(gru_out)   # [B, T_slow, num_gates]
+        gate_signals = torch.sigmoid(gate_logits)  # [B, T_slow, num_gates]
+        return gate_signals

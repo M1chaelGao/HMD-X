@@ -1,26 +1,23 @@
 import ast
 import glob
 import os
-
 import torch
 from torch.utils.data import Dataset
+import numpy as np
+
 
 def get_path(dataset_path, split):
-    # if split == "test":
-    #     filenames_test = os.path.join(dataset_path, '*/test/*.pt')
-    #     # 读取文件并解析成 Python 列表
-    #     with open("/home/wh0146/AGRoL-main/AGRoL-main/111.txt", "r") as f:
-    #         data_list_path = ast.literal_eval(f.read())  # 解析成列表
-    #     return data_list_path
     data_list_path = []
     parent_data_path = glob.glob(dataset_path + "/*")
     for d in parent_data_path:
         if os.path.isdir(d):
             if os.path.exists(d + "/" + split):
-                files = glob.glob(d + "/" + split + "/*pt")
+                # 仅查找新生成的带_contact标签的文件
+                files = glob.glob(d + "/" + split + "/*_with_contact.pt")
                 if len(files) > 0:
                     data_list_path.extend(files)
     return data_list_path
+
 
 def load_data(dataset_path, split, **kwargs):
     motion_list = get_path(dataset_path, split)
@@ -28,7 +25,7 @@ def load_data(dataset_path, split, **kwargs):
     motion_raw_data = []
     for data_i in motion_list:
         motion_raw_data.extend(torch.load(data_i))
-    
+
     valid_motion_data = []
     tmp_data_list = []
     for data in motion_raw_data:
@@ -39,23 +36,27 @@ def load_data(dataset_path, split, **kwargs):
         gt_global_pose = data["rotation_global_full_gt_list"]
         gt_positions = data["position_global_full_gt_world"]
         gt_betas = data["body_parms_list"]['betas'][1:]
+        # 强制要求必须有gt_contact标签
+        gt_contact = data['gt_contact']
         tmp_data_list.append(gt_local_pose)
         valid_motion_data.append({
             'input_feat': input_feat,
             'gt_local_pose': gt_local_pose,
             'gt_global_pose': gt_global_pose,
             'gt_positions': gt_positions,
-            'gt_betas': gt_betas
+            'gt_betas': gt_betas,
+            'gt_contact': gt_contact
         })
     return valid_motion_data
-    
+
+
 class TrainDataset(Dataset):
     def __init__(
-        self,
-        train_datas,
-        compatible_inputs=['HMD', 'HMD_2IMUs', 'HMD_3IMUs'],
-        input_motion_length=40,
-        train_dataset_repeat_times=1,
+            self,
+            train_datas,
+            compatible_inputs=['HMD', 'HMD_2IMUs', 'HMD_3IMUs'],
+            input_motion_length=40,
+            train_dataset_repeat_times=1,
     ):
         self.compatible_inputs = compatible_inputs
         self.train_dataset_repeat_times = train_dataset_repeat_times
@@ -68,44 +69,49 @@ class TrainDataset(Dataset):
     def __getitem__(self, idx):
         motion_data = self.motions[idx % len(self.motions)]
         seqlen = motion_data['input_feat'].shape[0]
+        gt_contact = motion_data['gt_contact']
 
         if seqlen <= self.input_motion_length:
             idx = 0
         else:
             idx = torch.randint(0, int(seqlen - self.input_motion_length), (1,))[0]
-        
-        gt_local_pose = motion_data['gt_local_pose'][idx : idx + self.input_motion_length]
-        gt_global_pose = motion_data['gt_global_pose'][idx : idx + self.input_motion_length]
-        gt_positions = motion_data['gt_positions'][idx : idx + self.input_motion_length]
-        gt_betas = motion_data['gt_betas'][idx : idx + self.input_motion_length]
-        
+
+        gt_local_pose = motion_data['gt_local_pose'][idx: idx + self.input_motion_length]
+        gt_global_pose = motion_data['gt_global_pose'][idx: idx + self.input_motion_length]
+        gt_positions = motion_data['gt_positions'][idx: idx + self.input_motion_length]
+        gt_betas = motion_data['gt_betas'][idx: idx + self.input_motion_length]
+        gt_contact = gt_contact[idx: idx + self.input_motion_length]
+
         input_feat_all = []
         if 'HMD_3IMUs' in self.compatible_inputs:
-            input_feat = motion_data['input_feat'][idx : idx + self.input_motion_length].clone()
+            input_feat = motion_data['input_feat'][idx: idx + self.input_motion_length].clone()
             input_feat_all.append(input_feat)
         if 'HMD_2IMUs' in self.compatible_inputs:
-            input_feat = motion_data['input_feat'][idx : idx + self.input_motion_length].clone()
-            input_feat[:, list(range(18, 24)) + list(range(42, 48))] = 0  # 去根，补0
+            input_feat = motion_data['input_feat'][idx: idx + self.input_motion_length].clone()
+            input_feat[:, list(range(18, 24)) + list(range(42, 48))] = 0
             input_feat_all.append(input_feat)
         if 'HMD' in self.compatible_inputs:
-            input_feat = motion_data['input_feat'][idx : idx + self.input_motion_length].clone()
-            input_feat[:, list(range(6, 24)) + list(range(30, 48))] = 0  # 去根和双小腿，补0
+            input_feat = motion_data['input_feat'][idx: idx + self.input_motion_length].clone()
+            input_feat[:, list(range(6, 24)) + list(range(30, 48))] = 0
             input_feat_all.append(input_feat)
-        
+
         input_feat_res = torch.stack(input_feat_all, dim=0)
         gt_local_pose = gt_local_pose.unsqueeze(0).repeat(input_feat_res.shape[0], 1, 1)
         gt_global_pose = gt_global_pose.unsqueeze(0).repeat(input_feat_res.shape[0], 1, 1)
         gt_positions = gt_positions.unsqueeze(0).repeat(input_feat_res.shape[0], 1, 1, 1)
         gt_betas = gt_betas.unsqueeze(0).repeat(input_feat_res.shape[0], 1, 1)
-        return input_feat_res, gt_local_pose, gt_global_pose, gt_positions, gt_betas
+        gt_contact = torch.from_numpy(gt_contact).float() if isinstance(gt_contact, np.ndarray) else gt_contact
+        gt_contact = gt_contact.unsqueeze(0).repeat(input_feat_res.shape[0], 1, 1)
+        return input_feat_res, gt_local_pose, gt_global_pose, gt_positions, gt_betas, gt_contact
+
 
 class TestDataset(Dataset):
     def __init__(
-        self,
-        train_datas,
-        compatible_inputs=['HMD', 'HMD_2IMUs', 'HMD_3IMUs'],
-        input_motion_length=40,
-        train_dataset_repeat_times=1,
+            self,
+            train_datas,
+            compatible_inputs=['HMD', 'HMD_2IMUs', 'HMD_3IMUs'],
+            input_motion_length=40,
+            train_dataset_repeat_times=1,
     ):
         self.compatible_inputs = compatible_inputs
         self.train_dataset_repeat_times = train_dataset_repeat_times
@@ -117,6 +123,7 @@ class TestDataset(Dataset):
 
     def __getitem__(self, idx):
         motion_data = self.motions[idx % len(self.motions)]
+        gt_contact = motion_data['gt_contact']
 
         input_feat = motion_data['input_feat']
         gt_local_pose = motion_data['gt_local_pose']
@@ -124,10 +131,11 @@ class TestDataset(Dataset):
         gt_positions = motion_data['gt_positions']
         gt_betas = motion_data['gt_betas']
         assert input_feat.shape[0] == gt_local_pose.shape[0] and \
-            gt_local_pose.shape[0] == gt_global_pose.shape[0] and \
-            gt_global_pose.shape[0] == gt_positions.shape[0] and \
-            gt_positions.shape[0] == gt_betas.shape[0]
-        
+               gt_local_pose.shape[0] == gt_global_pose.shape[0] and \
+               gt_global_pose.shape[0] == gt_positions.shape[0] and \
+               gt_positions.shape[0] == gt_betas.shape[0] and \
+               gt_positions.shape[0] == gt_contact.shape[0]
+
         input_feat_all = []
         if 'HMD_3IMUs' in self.compatible_inputs:
             input_feat = motion_data['input_feat'].clone()
@@ -140,10 +148,12 @@ class TestDataset(Dataset):
             input_feat = motion_data['input_feat'].clone()
             input_feat[:, list(range(6, 24)) + list(range(30, 48))] = 0
             input_feat_all.append(input_feat)
-            
+
         input_feat_res = torch.stack(input_feat_all, dim=0)
         gt_local_pose = gt_local_pose.unsqueeze(0).repeat(input_feat_res.shape[0], 1, 1)
         gt_global_pose = gt_global_pose.unsqueeze(0).repeat(input_feat_res.shape[0], 1, 1)
         gt_positions = gt_positions.unsqueeze(0).repeat(input_feat_res.shape[0], 1, 1, 1)
         gt_betas = gt_betas.unsqueeze(0).repeat(input_feat_res.shape[0], 1, 1)
-        return input_feat_res, gt_local_pose, gt_global_pose, gt_positions, gt_betas
+        gt_contact = torch.from_numpy(gt_contact).float() if isinstance(gt_contact, np.ndarray) else gt_contact
+        gt_contact = gt_contact.unsqueeze(0).repeat(input_feat_res.shape[0], 1, 1)
+        return input_feat_res, gt_local_pose, gt_global_pose, gt_positions, gt_betas, gt_contact

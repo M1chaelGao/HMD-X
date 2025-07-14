@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from model.network import HMD_imu_HME_Universe, ExpertRefiner, MoEHead, GruMSGN
+from model.network import HMD_imu_HME_Universe, ExpertRefiner, MoEHead, GruMSGN, PhysicsEncoder
 from utils import utils_transform
 from human_body_prior.body_model.body_model import BodyModel
 import os
@@ -37,36 +37,39 @@ class HMDIMUModel(nn.Module):
         hidden_size = configs.model_params.hidden_size
         aggregated_feature_dim = hidden_size * 6
 
-        # --- START: Corrected SMPL Joint Indexing ---
-
-        # A kinematically sound partition based on the standard 22-joint SMPL model
-        self.trunk_joints = [0, 3, 6, 9]  # Pelvis, Spine1, Spine2, Spine3
-        self.lower_joints = [1, 2, 4, 5, 7, 8, 10, 11]  # Hips, Knees, Ankles, Feet
-        self.upper_joints = [12, 13, 14, 15, 16, 17, 18, 19, 20, 21]  # Neck, Head, Collars, Shoulders, Elbows, Wrists
+        # SMPL Joint Indexing
+        self.trunk_joints = [0, 3, 6, 9]
+        self.lower_joints = [1, 2, 4, 5, 7, 8, 10, 11]
+        self.upper_joints = [12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
 
         self.trunk_dims = []
         for j in self.trunk_joints:
-            self.trunk_dims.extend(list(range(j * 6, (j + 1) * 6)))
+            self.trunk_dims.extend(list(range(j*6, (j+1)*6)))
         self.lower_dims = []
         for j in self.lower_joints:
-            self.lower_dims.extend(list(range(j * 6, (j + 1) * 6)))
+            self.lower_dims.extend(list(range(j*6, (j+1)*6)))
         self.upper_dims = []
         for j in self.upper_joints:
-            self.upper_dims.extend(list(range(j * 6, (j + 1) * 6)))
+            self.upper_dims.extend(list(range(j*6, (j+1)*6)))
 
-        # Convert to torch tensors for efficient indexing
         self.device = device
         self.trunk_dims = torch.tensor(self.trunk_dims, dtype=torch.long, device=self.device)
         self.lower_dims = torch.tensor(self.lower_dims, dtype=torch.long, device=self.device)
         self.upper_dims = torch.tensor(self.upper_dims, dtype=torch.long, device=self.device)
 
-        # --- END: Corrected SMPL Joint Indexing ---
+        # PhysicsEncoder for contact prediction
+        self.physics_encoder = PhysicsEncoder(
+            feature_dim=aggregated_feature_dim,
+            hidden_dim=128,
+            out_dim=2
+        ).to(device)
 
         # Gating network and MoE modules
         self.gating_network = GruMSGN(
             feature_dim=aggregated_feature_dim,
             hidden_dim=256,
-            num_gates=3
+            out_dim=3,  # 这里用 out_dim 代表门的数量
+            num_layers=1
         ).to(device)
         self.moe_trunk = MoEHead(
             feature_dim=aggregated_feature_dim,
@@ -88,8 +91,8 @@ class HMDIMUModel(nn.Module):
         subject_gender = "neutral"
         bm_fname = os.path.join(support_dir, 'smplh/{}/model.npz'.format(subject_gender))
         dmpl_fname = os.path.join(support_dir, 'dmpls/{}/model.npz'.format(subject_gender))
-        num_betas = 16 # number of body parameters
-        num_dmpls = 8 # number of DMPL parameters
+        num_betas = 16
+        num_dmpls = 8
         self.bm = BodyModel(bm_fname=bm_fname, num_betas=num_betas, num_dmpls=num_dmpls, dmpl_fname=dmpl_fname).to(device)
 
     def fk_module(self, global_orientation, joint_rotation, body_shape):
@@ -145,6 +148,12 @@ class HMDIMUModel(nn.Module):
         fast_features = aggregated_features
         slow_features = aggregated_features[:, ::2, :]
 
+        # Predict contact probabilities for the whole sequence
+        pred_contact_probs = self.physics_encoder(aggregated_features)  # [B, T, 2]
+
+        # Downsample contact context to match slow_features' temporal stride
+        contact_context_slow = pred_contact_probs[:, ::2, :]  # [B, T_slow, 2]
+
         # Upsample slow features to match time_length
         slow_features_upsampled = slow_features.repeat_interleave(2, dim=1)
         if slow_features_upsampled.shape[1] > time_length:
@@ -154,8 +163,8 @@ class HMDIMUModel(nn.Module):
             pad = torch.zeros(pad_shape, device=slow_features_upsampled.device, dtype=slow_features_upsampled.dtype)
             slow_features_upsampled = torch.cat([slow_features_upsampled, pad], dim=1)
 
-        #gate_signals = self.gating_network(slow_features)
-        gate_signals = torch.full((slow_features.shape[0], slow_features.shape[1], 3), 0.5, device=self.device)
+        # Gating network: pass both slow_features and contact_context_slow
+        gate_signals = self.gating_network(slow_features, contact_context_slow)
         gate_signals_upsampled = gate_signals.repeat_interleave(2, dim=1)
         if gate_signals_upsampled.shape[1] > time_length:
             gate_signals_upsampled = gate_signals_upsampled[:, :time_length, :]
@@ -164,10 +173,8 @@ class HMDIMUModel(nn.Module):
             pad = torch.zeros(pad_shape, device=gate_signals_upsampled.device, dtype=gate_signals_upsampled.dtype)
             gate_signals_upsampled = torch.cat([gate_signals_upsampled, pad], dim=1)
 
-        # Hierarchical MoE correction (in-place performance optimization)
+        # Hierarchical MoE correction
         refined_pose = pose_draft.clone()
-
-        # Trunk correction
         residual_trunk = self.moe_trunk(
             refined_pose[:, :, self.trunk_dims],
             fast_features,
@@ -175,7 +182,6 @@ class HMDIMUModel(nn.Module):
         )
         refined_pose[:, :, self.trunk_dims] += residual_trunk
 
-        # Lower body correction
         residual_lower = self.moe_lower(
             refined_pose[:, :, self.lower_dims],
             fast_features,
@@ -183,7 +189,6 @@ class HMDIMUModel(nn.Module):
         )
         refined_pose[:, :, self.lower_dims] += residual_lower
 
-        # Upper body correction
         residual_upper = self.moe_upper(
             refined_pose[:, :, self.upper_dims],
             fast_features,
@@ -203,6 +208,6 @@ class HMDIMUModel(nn.Module):
                 pred_shapes.reshape(-1, 16)
             )
             pred_joint_position = pred_joint_position.reshape(batch_size, time_length, 22, 3)
-            return pred_pose, pred_shapes, rotation_global_r6d, pred_joint_position
+            return pred_pose, pred_shapes, rotation_global_r6d, pred_joint_position, pred_contact_probs, gate_signals_upsampled
         else:
-            return pred_pose, pred_shapes, rotation_global_r6d
+            return pred_pose, pred_shapes, rotation_global_r6d, pred_contact_probs, gate_signals_upsampled

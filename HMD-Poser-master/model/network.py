@@ -176,20 +176,45 @@ class MoEHead(nn.Module):
         return mixed_residual
 
 
-class GruMSGN(nn.Module):
-    def __init__(self, feature_dim, hidden_dim, num_gates=3):
+class PhysicsEncoder(nn.Module):
+    def __init__(self, feature_dim=1536, hidden_dim=128, out_dim=2):
         super().__init__()
         self.gru = nn.GRU(
             input_size=feature_dim,
             hidden_size=hidden_dim,
-            num_layers=1,
             batch_first=True,
-            bidirectional=True
+            bidirectional=False
         )
-        self.fc_gate = nn.Linear(hidden_dim * 2, num_gates)
+        self.predictor = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim, out_dim),
+            nn.Sigmoid()
+        )
 
-    def forward(self, slow_features):
-        gru_out, _ = self.gru(slow_features)
-        gate_logits = self.fc_gate(gru_out)
-        gate_signals = torch.sigmoid(gate_logits)
-        return gate_signals
+    def forward(self, features):
+        # features: [B, T, feature_dim]
+        gru_out, _ = self.gru(features)  # [B, T, hidden_dim]
+        contact_probs = self.predictor(gru_out)  # [B, T, out_dim]
+        return contact_probs
+
+class GruMSGN(nn.Module):
+    def __init__(self, feature_dim, hidden_dim, out_dim, num_layers=1):
+        super().__init__()
+        # 修改input_size为 feature_dim + 2
+        self.gru = nn.GRU(
+            input_size=feature_dim + 2,  # 拼接接触概率
+            hidden_size=hidden_dim,
+            batch_first=True,
+            num_layers=num_layers,
+            bidirectional=False
+        )
+        self.out_layer = nn.Linear(hidden_dim, out_dim)
+
+    def forward(self, slow_features, contact_context):
+        # slow_features: [B, T, feature_dim]
+        # contact_context: [B, T, 2]
+        x = torch.cat([slow_features, contact_context], dim=-1)  # [B, T, feature_dim+2]
+        gru_out, _ = self.gru(x)
+        out = self.out_layer(gru_out)
+        return out

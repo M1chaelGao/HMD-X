@@ -19,39 +19,37 @@ def train_loop(configs, device, model, loss_func, optimizer, \
         LOG.info(f'Training epoch: {epoch + 1}/{configs.train_config.epochs}, LR: {current_lr:.6f}')
 
         one_epoch_root_loss, one_epoch_lpose_loss, one_epoch_gpose_loss, one_epoch_joint_loss, \
-            one_epoch_acc_loss, one_epoch_shape_loss, one_epoch_total_loss = [], [], [], [], [], [], []
+            one_epoch_acc_loss, one_epoch_shape_loss, one_epoch_total_loss,one_epoch_contact_loss = [], [], [], [], [], [], [],[]
 
-        # <<< --- START OF SMOKE TEST MODIFICATION --- >>>
-        #SMOKE_TEST_ITERATIONS = 15  # We'll just run 5 batches
-        # <<< ---  END OF SMOKE TEST MODIFICATION  --- >>>
-
-        for batch_idx, (input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas) in enumerate(train_loader):
-
-            # <<< --- START OF SMOKE TEST MODIFICATION --- >>>
-            #if batch_idx >= SMOKE_TEST_ITERATIONS:
-                #print(f"--- Smoke test: Train loop limited to {SMOKE_TEST_ITERATIONS} iterations. Breaking. ---")
-                #break
-            # <<< ---  END OF SMOKE TEST MODIFICATION  --- >>>
-
+        for batch_idx, (input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas, gt_contact) in enumerate(
+                train_loader):
             global_step += 1
             optimizer.zero_grad()
             batch_start = time.time()
-            input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas = input_feat.to(device).float(), \
+            input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas,gt_contact = input_feat.to(device).float(), \
                 gt_local_pose.to(device).float(), gt_global_pose.to(device).float(), \
-                    gt_positions.to(device).float(), gt_betas.to(device).float()
+                    gt_positions.to(device).float(), gt_betas.to(device).float(),\
+                gt_contact.to(device).float()
             if len(input_feat.shape) == 4:
                 input_feat = torch.flatten(input_feat, start_dim=0, end_dim=1)
                 gt_local_pose = torch.flatten(gt_local_pose, start_dim=0, end_dim=1)
                 gt_global_pose = torch.flatten(gt_global_pose, start_dim=0, end_dim=1)
                 gt_positions = torch.flatten(gt_positions, start_dim=0, end_dim=1)
                 gt_betas = torch.flatten(gt_betas, start_dim=0, end_dim=1)
+                gt_contact = torch.flatten(gt_contact, start_dim=0, end_dim=1)
 
-            pred_local_pose, pred_betas, rotation_global_r6d, pred_joint_position = model(input_feat)
+            # 新模型返回pred_contact_probs
+            pred_local_pose, pred_betas, rotation_global_r6d, pred_joint_position, pred_contact_probs, gate_signals_upsampled = model(
+                input_feat)
             pred_joint_position_head_centered = pred_joint_position - pred_joint_position[:, :, 15:16] + gt_positions[:, :, 15:16]
             gt_positions_head_centered = gt_positions
-            root_orientation_loss, local_pose_loss, global_pose_loss, joint_position_loss, accel_loss, shape_loss, total_loss = \
-                loss_func(pred_local_pose[:, :, :6], pred_local_pose[:, :, 6:], rotation_global_r6d, pred_joint_position_head_centered, pred_betas, \
-                    gt_local_pose[:, :, :6], gt_local_pose[:, :, 6:], gt_global_pose, gt_positions_head_centered, gt_betas)
+            # 损失函数增加pred_contact_probs, gt_contact
+            losses = loss_func(
+                pred_local_pose[:, :, :6], pred_local_pose[:, :, 6:], rotation_global_r6d, pred_joint_position_head_centered, pred_betas,
+                gt_local_pose[:, :, :6], gt_local_pose[:, :, 6:], gt_global_pose, gt_positions_head_centered, gt_betas,
+                pred_contact_probs, gt_contact
+            )
+            root_orientation_loss, local_pose_loss, global_pose_loss, joint_position_loss, accel_loss, shape_loss, contact_loss, total_loss = losses
             total_loss.backward()
             optimizer.step()
             lr_scheduler.step()
@@ -63,6 +61,7 @@ def train_loop(configs, device, model, loss_func, optimizer, \
             one_epoch_joint_loss.append(joint_position_loss.item())
             one_epoch_acc_loss.append(accel_loss.item())
             one_epoch_shape_loss.append(shape_loss.item())
+            one_epoch_contact_loss.append(contact_loss.item())
             one_epoch_total_loss.append(total_loss.item())
             batch_time = time.time() - batch_start
 
@@ -78,7 +77,8 @@ def train_loop(configs, device, model, loss_func, optimizer, \
                     'global_pose_loss': round(float(global_pose_loss.item()), 3),
                     'joint_3d_loss': round(float(joint_position_loss.item()), 3),
                     'smooth_loss': round(float(accel_loss.item()), 3),
-                    'shape_loss': round(float(shape_loss.item()), 3)
+                    'shape_loss': round(float(shape_loss.item()), 3),
+                    'contact_loss': round(float(contact_loss.item()), 3)
                 }
                 LOG.info(batch_info)
         one_epoch_root_loss = torch.tensor(one_epoch_root_loss).mean().item()
@@ -87,6 +87,7 @@ def train_loop(configs, device, model, loss_func, optimizer, \
         one_epoch_joint_loss = torch.tensor(one_epoch_joint_loss).mean().item()
         one_epoch_acc_loss = torch.tensor(one_epoch_acc_loss).mean().item()
         one_epoch_shape_loss = torch.tensor(one_epoch_shape_loss).mean().item()
+        one_epoch_contact_loss = torch.tensor(one_epoch_contact_loss).mean().item()
         one_epoch_total_loss = torch.tensor(one_epoch_total_loss).mean().item()
 
         train_summary_writer.add_scalar(
@@ -103,6 +104,8 @@ def train_loop(configs, device, model, loss_func, optimizer, \
             'train_epoch_loss/smooth_loss', one_epoch_acc_loss, epoch)
         train_summary_writer.add_scalar(
             'train_epoch_loss/shape_loss', one_epoch_shape_loss, epoch)
+        train_summary_writer.add_scalar(
+            'train_epoch_loss/contact_loss', one_epoch_contact_loss, epoch)
 
         epoch_info = {
             'type': 'train',
@@ -113,7 +116,8 @@ def train_loop(configs, device, model, loss_func, optimizer, \
             'global_pose_loss': round(float(one_epoch_gpose_loss), 3),
             'joint_3d_loss': round(float(one_epoch_joint_loss), 3),
             'smooth_loss': round(float(one_epoch_acc_loss), 3),
-            'shape_loss': round(float(one_epoch_shape_loss), 3)
+            'shape_loss': round(float(one_epoch_shape_loss), 3),
+            'contact_loss': round(float(one_epoch_contact_loss), 3)
         }
         LOG.info(epoch_info)
 
@@ -128,34 +132,38 @@ def train_loop(configs, device, model, loss_func, optimizer, \
         if epoch % configs.train_config.val_interval == 0:
             model.eval()
             one_epoch_root_loss, one_epoch_lpose_loss, one_epoch_gpose_loss, one_epoch_joint_loss, \
-                one_epoch_acc_loss, one_epoch_shape_loss, one_epoch_total_loss = [], [], [], [], [], [], []
+                one_epoch_acc_loss, one_epoch_shape_loss, one_epoch_total_loss, one_epoch_contact_loss = [], [], [], [], [], [], [], []
             position_error_, local_pose_error_ = [], []
             with torch.no_grad():
-                for batch_idx_test, (input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas) in tqdm(enumerate(test_loader)):
-
-                    # <<< --- START OF SMOKE TEST MODIFICATION --- >>>
-                    #if batch_idx_test >= SMOKE_TEST_ITERATIONS:
-                        #print(f"--- Smoke test: Validation loop limited to {SMOKE_TEST_ITERATIONS} iterations. Breaking. ---")
-                        #break
-                    # <<< ---  END OF SMOKE TEST MODIFICATION  --- >>>
-
-                    input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas = input_feat.to(device).float(), \
-                        gt_local_pose.to(device).float(), gt_global_pose.to(device).float(), \
-                            gt_positions.to(device).float(), gt_betas.to(device).float()
+                for batch_idx_test, (input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas, gt_contact) in tqdm(enumerate(test_loader)):
+                    input_feat, gt_local_pose, gt_global_pose, gt_positions, gt_betas, gt_contact = \
+                        input_feat.to(device).float(), \
+                        gt_local_pose.to(device).float(), \
+                        gt_global_pose.to(device).float(), \
+                        gt_positions.to(device).float(), \
+                        gt_betas.to(device).float(), \
+                        gt_contact.to(device).float()
                     if len(input_feat.shape) == 4:
                         input_feat = torch.flatten(input_feat, start_dim=0, end_dim=1)
                         gt_local_pose = torch.flatten(gt_local_pose, start_dim=0, end_dim=1)
                         gt_global_pose = torch.flatten(gt_global_pose, start_dim=0, end_dim=1)
                         gt_positions = torch.flatten(gt_positions, start_dim=0, end_dim=1)
                         gt_betas = torch.flatten(gt_betas, start_dim=0, end_dim=1)
+                        gt_contact = torch.flatten(gt_contact, start_dim=0, end_dim=1)
 
-                    pred_local_pose, pred_betas, rotation_global_r6d, pred_joint_position = model(input_feat)
+                    # 新模型返回pred_contact_probs
+                    pred_local_pose, pred_betas, rotation_global_r6d, pred_joint_position, pred_contact_probs, gate_signals_upsampled = model(
+                        input_feat)
 
                     pred_joint_position_head_centered = pred_joint_position - pred_joint_position[:, :, 15:16] + gt_positions[:, :, 15:16]
                     gt_positions_head_centered = gt_positions
-                    root_orientation_loss, local_pose_loss, global_pose_loss, joint_position_loss, accel_loss, shape_loss, total_loss = \
-                        loss_func(pred_local_pose[:, :, :6], pred_local_pose[:, :, 6:], rotation_global_r6d, pred_joint_position_head_centered, pred_betas, \
-                            gt_local_pose[:, :, :6], gt_local_pose[:, :, 6:], gt_global_pose, gt_positions_head_centered, gt_betas)
+                    # 损失函数增加pred_contact_probs, gt_contact
+                    losses = loss_func(
+                        pred_local_pose[:, :, :6], pred_local_pose[:, :, 6:], rotation_global_r6d, pred_joint_position_head_centered, pred_betas,
+                        gt_local_pose[:, :, :6], gt_local_pose[:, :, 6:], gt_global_pose, gt_positions_head_centered, gt_betas,
+                        pred_contact_probs, gt_contact
+                    )
+                    root_orientation_loss, local_pose_loss, global_pose_loss, joint_position_loss, accel_loss, shape_loss, contact_loss, total_loss = losses
 
                     pos_error_ = torch.mean(torch.sqrt(
                         torch.sum(
@@ -178,6 +186,7 @@ def train_loop(configs, device, model, loss_func, optimizer, \
                     one_epoch_joint_loss.append(joint_position_loss.item())
                     one_epoch_acc_loss.append(accel_loss.item())
                     one_epoch_shape_loss.append(shape_loss.item())
+                    one_epoch_contact_loss.append(contact_loss.item())
                     one_epoch_total_loss.append(total_loss.item())
 
             one_epoch_root_loss = torch.tensor(one_epoch_root_loss).mean().item()
@@ -186,28 +195,21 @@ def train_loop(configs, device, model, loss_func, optimizer, \
             one_epoch_joint_loss = torch.tensor(one_epoch_joint_loss).mean().item()
             one_epoch_acc_loss = torch.tensor(one_epoch_acc_loss).mean().item()
             one_epoch_shape_loss = torch.tensor(one_epoch_shape_loss).mean().item()
+            one_epoch_contact_loss = torch.tensor(one_epoch_contact_loss).mean().item()
             one_epoch_total_loss = torch.tensor(one_epoch_total_loss).mean().item()
             position_error_ = torch.tensor(position_error_).mean().item()
             local_pose_error_ = torch.tensor(local_pose_error_).mean().item()
 
-            train_summary_writer.add_scalar(
-                'val_epoch_loss/loss_total', one_epoch_total_loss, epoch)
-            train_summary_writer.add_scalar(
-                'val_epoch_loss/root_orientation_loss', one_epoch_root_loss, epoch)
-            train_summary_writer.add_scalar(
-                'val_epoch_loss/local_pose_loss', one_epoch_lpose_loss, epoch)
-            train_summary_writer.add_scalar(
-                'val_epoch_loss/global_pose_loss', one_epoch_gpose_loss, epoch)
-            train_summary_writer.add_scalar(
-                'val_epoch_loss/joint_3d_loss', one_epoch_joint_loss, epoch)
-            train_summary_writer.add_scalar(
-                'val_epoch_loss/smooth_loss', one_epoch_acc_loss, epoch)
-            train_summary_writer.add_scalar(
-                'val_epoch_loss/shape_loss', one_epoch_shape_loss, epoch)
-            train_summary_writer.add_scalar(
-                'val_epoch_loss/position_error', position_error_, epoch)
-            train_summary_writer.add_scalar(
-                'val_epoch_loss/local_pose_error', local_pose_error_, epoch)
+            train_summary_writer.add_scalar('val_epoch_loss/loss_total', one_epoch_total_loss, epoch)
+            train_summary_writer.add_scalar('val_epoch_loss/root_orientation_loss', one_epoch_root_loss, epoch)
+            train_summary_writer.add_scalar('val_epoch_loss/local_pose_loss', one_epoch_lpose_loss, epoch)
+            train_summary_writer.add_scalar('val_epoch_loss/global_pose_loss', one_epoch_gpose_loss, epoch)
+            train_summary_writer.add_scalar('val_epoch_loss/joint_3d_loss', one_epoch_joint_loss, epoch)
+            train_summary_writer.add_scalar('val_epoch_loss/smooth_loss', one_epoch_acc_loss, epoch)
+            train_summary_writer.add_scalar('val_epoch_loss/shape_loss', one_epoch_shape_loss, epoch)
+            train_summary_writer.add_scalar('val_epoch_loss/contact_loss', one_epoch_contact_loss, epoch)
+            train_summary_writer.add_scalar('val_epoch_loss/position_error', position_error_, epoch)
+            train_summary_writer.add_scalar('val_epoch_loss/local_pose_error', local_pose_error_, epoch)
 
             epoch_info = {
                 'type': 'test',
@@ -219,6 +221,7 @@ def train_loop(configs, device, model, loss_func, optimizer, \
                 'joint_3d_loss': round(float(one_epoch_joint_loss), 3),
                 'smooth_loss': round(float(one_epoch_acc_loss), 3),
                 'shape_loss': round(float(one_epoch_shape_loss), 3),
+                'contact_loss': round(float(one_epoch_contact_loss), 3),
                 'MPJPE': round(float(position_error_), 3),
                 'MPJRE_with_Root': round(float(local_pose_error_), 3)
             }
@@ -241,7 +244,3 @@ def train_loop(configs, device, model, loss_func, optimizer, \
                 best_local_pose = local_pose_error_
                 LOG.info("Lowest MPJRE_(including root) {} in epoch {}".format(best_local_pose, epoch+1))
 
-        # <<< --- START OF SMOKE TEST MODIFICATION --- >>>
-        #print(f"--- Smoke test: Only running for 1 epoch. Breaking outer loop. ---")
-        #break # We only need to run one epoch for a smoke test
-        # <<< ---  END OF SMOKE TEST MODIFICATION  --- >>>

@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from model.network import HMD_imu_HME_Universe, UnifiedRefiner
+from model.network import HMD_imu_HME_Universe, ExpertRefiner, MoEHead, GruMSGN
 from utils import utils_transform
 from human_body_prior.body_model.body_model import BodyModel
 import os
@@ -36,9 +36,51 @@ class HMDIMUModel(nn.Module):
             ).to(device)
         hidden_size = configs.model_params.hidden_size
         aggregated_feature_dim = hidden_size * 6
-        self.refiner = UnifiedRefiner(
+
+        # --- START: Corrected SMPL Joint Indexing ---
+
+        # A kinematically sound partition based on the standard 22-joint SMPL model
+        self.trunk_joints = [0, 3, 6, 9]  # Pelvis, Spine1, Spine2, Spine3
+        self.lower_joints = [1, 2, 4, 5, 7, 8, 10, 11]  # Hips, Knees, Ankles, Feet
+        self.upper_joints = [12, 13, 14, 15, 16, 17, 18, 19, 20, 21]  # Neck, Head, Collars, Shoulders, Elbows, Wrists
+
+        self.trunk_dims = []
+        for j in self.trunk_joints:
+            self.trunk_dims.extend(list(range(j * 6, (j + 1) * 6)))
+        self.lower_dims = []
+        for j in self.lower_joints:
+            self.lower_dims.extend(list(range(j * 6, (j + 1) * 6)))
+        self.upper_dims = []
+        for j in self.upper_joints:
+            self.upper_dims.extend(list(range(j * 6, (j + 1) * 6)))
+
+        # Convert to torch tensors for efficient indexing
+        self.device = device
+        self.trunk_dims = torch.tensor(self.trunk_dims, dtype=torch.long, device=self.device)
+        self.lower_dims = torch.tensor(self.lower_dims, dtype=torch.long, device=self.device)
+        self.upper_dims = torch.tensor(self.upper_dims, dtype=torch.long, device=self.device)
+
+        # --- END: Corrected SMPL Joint Indexing ---
+
+        # Gating network and MoE modules
+        self.gating_network = GruMSGN(
             feature_dim=aggregated_feature_dim,
-            pose_dim=22*6,
+            hidden_dim=256,
+            num_gates=3
+        ).to(device)
+        self.moe_trunk = MoEHead(
+            feature_dim=aggregated_feature_dim,
+            pose_dim=len(self.trunk_dims),
+            hidden_dim=512
+        ).to(device)
+        self.moe_lower = MoEHead(
+            feature_dim=aggregated_feature_dim,
+            pose_dim=len(self.lower_dims),
+            hidden_dim=512
+        ).to(device)
+        self.moe_upper = MoEHead(
+            feature_dim=aggregated_feature_dim,
+            pose_dim=len(self.upper_dims),
             hidden_dim=512
         ).to(device)
 
@@ -101,13 +143,10 @@ class HMDIMUModel(nn.Module):
         pose_draft, pred_shapes, aggregated_features = self.netG(sparse_input, return_features=True)
 
         fast_features = aggregated_features
-        # Downsample by stride 2 for slow features
         slow_features = aggregated_features[:, ::2, :]
 
-        # Upsample slow features to time_length
-        # repeat_interleave: each slow frame covers 2 fast frames, so repeat 2 times
+        # Upsample slow features to match time_length
         slow_features_upsampled = slow_features.repeat_interleave(2, dim=1)
-        # If time_length is odd, slow_features_upsampled may be longer, so truncate or pad
         if slow_features_upsampled.shape[1] > time_length:
             slow_features_upsampled = slow_features_upsampled[:, :time_length, :]
         elif slow_features_upsampled.shape[1] < time_length:
@@ -115,9 +154,44 @@ class HMDIMUModel(nn.Module):
             pad = torch.zeros(pad_shape, device=slow_features_upsampled.device, dtype=slow_features_upsampled.dtype)
             slow_features_upsampled = torch.cat([slow_features_upsampled, pad], dim=1)
 
-        fused_features = fast_features + slow_features_upsampled
-        pose_residual = self.refiner(pose_draft, fused_features)
-        pred_pose = pose_draft + pose_residual
+        #gate_signals = self.gating_network(slow_features)
+        gate_signals = torch.full((slow_features.shape[0], slow_features.shape[1], 3), 0.5, device=self.device)
+        gate_signals_upsampled = gate_signals.repeat_interleave(2, dim=1)
+        if gate_signals_upsampled.shape[1] > time_length:
+            gate_signals_upsampled = gate_signals_upsampled[:, :time_length, :]
+        elif gate_signals_upsampled.shape[1] < time_length:
+            pad_shape = (gate_signals_upsampled.shape[0], time_length - gate_signals_upsampled.shape[1], gate_signals_upsampled.shape[2])
+            pad = torch.zeros(pad_shape, device=gate_signals_upsampled.device, dtype=gate_signals_upsampled.dtype)
+            gate_signals_upsampled = torch.cat([gate_signals_upsampled, pad], dim=1)
+
+        # Hierarchical MoE correction (in-place performance optimization)
+        refined_pose = pose_draft.clone()
+
+        # Trunk correction
+        residual_trunk = self.moe_trunk(
+            refined_pose[:, :, self.trunk_dims],
+            fast_features,
+            gate_signals_upsampled[:, :, 0:1]
+        )
+        refined_pose[:, :, self.trunk_dims] += residual_trunk
+
+        # Lower body correction
+        residual_lower = self.moe_lower(
+            refined_pose[:, :, self.lower_dims],
+            fast_features,
+            gate_signals_upsampled[:, :, 1:2]
+        )
+        refined_pose[:, :, self.lower_dims] += residual_lower
+
+        # Upper body correction
+        residual_upper = self.moe_upper(
+            refined_pose[:, :, self.upper_dims],
+            fast_features,
+            gate_signals_upsampled[:, :, 2:3]
+        )
+        refined_pose[:, :, self.upper_dims] += residual_upper
+
+        pred_pose = refined_pose
 
         rotation_local_matrot = utils_transform.sixd2matrot(pred_pose.reshape(-1, 6)).reshape(batch_size*time_length, 22, 3, 3)
         rotation_global_matrot = forward_kinematics_R(rotation_local_matrot, self.bm.kintree_table[0][:22].long()).view(batch_size, time_length, 22, 3, 3)

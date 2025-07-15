@@ -218,3 +218,42 @@ class GruMSGN(nn.Module):
         gru_out, _ = self.gru(x)
         out = self.out_layer(gru_out)
         return out
+class TimeFPN(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(TimeFPN, self).__init__()
+        # Bottom-up (主干网络)
+        self.c1 = nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.c2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1, stride=2)
+        self.c3 = nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1, stride=2)
+
+        # Top-down (横向连接)
+        self.p3_conv = nn.Conv1d(out_channels, out_channels, kernel_size=1)
+        self.p2_conv = nn.Conv1d(out_channels, out_channels, kernel_size=1)
+        self.p1_conv = nn.Conv1d(out_channels, out_channels, kernel_size=1)
+
+        # Smoothing layers
+        self.p2_smooth = nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.p1_smooth = nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1)
+
+    def forward(self, features):
+        # features: [B, T, C_in]
+        # Permute to [B, C_in, T]
+        x = features.permute(0, 2, 1)
+
+        # Bottom-up pathway
+        t1 = F.relu(self.c1(x))      # [B, C_out, T]
+        t2 = F.relu(self.c2(t1))     # [B, C_out, T//2]
+        t3 = F.relu(self.c3(t2))     # [B, C_out, T//4]
+
+        # Top-down pathway + lateral connections
+        p3 = self.p3_conv(t3)        # [B, C_out, T//4]
+        p2 = self.p2_conv(t2) + F.interpolate(p3, size=t2.shape[2], mode='nearest')  # [B, C_out, T//2]
+        p2 = F.relu(self.p2_smooth(p2))
+        p1 = self.p1_conv(t1) + F.interpolate(p2, size=t1.shape[2], mode='nearest')  # [B, C_out, T]
+        p1 = F.relu(self.p1_smooth(p1))
+
+        # Permute back to [B, T, C_out]
+        p1 = p1.permute(0, 2, 1)
+        p2 = p2.permute(0, 2, 1)
+        p3 = p3.permute(0, 2, 1)
+        return [p1, p2, p3]

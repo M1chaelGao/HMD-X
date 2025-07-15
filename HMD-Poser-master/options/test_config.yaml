@@ -1,12 +1,12 @@
 task: "HMD_IMU_Human_Motion_Estimation"
 
 model_name: "HMD_imu_HME_Universe"
-dataset_path: "/home/wh0146/HMD-Poser-master/data_over_2ear_my/"
+dataset_path: "/home/4T-2/gyf/ProcessedHMDdata/"
 #dataset_path: "/home/4T-2/whl/datas/data_46_shape/"
-support_dir: "./body_models/"
-resume_model: "/home/wh0146/HMD-Poser-master/experiments/HMD_IMU_Human_Motion_Estimation/2025-01-10-15-55-32/epoch_with_best_testloss.pt"
+support_dir: "/home/gyf0108/Projects/MambaPoser/body_models/"
+resume_model: "/home/gyf0108/Projects/HMD+X/HMD-Poser-master/experiments/HMD_IMU_Human_Motion_Estimation/54D新基线/epoch_with_best_testloss.pt"
 manual_seed: null
-compatible_inputs: ['HMD', 'HMD_2IMUs', 'HMD_3IMUs'] 
+compatible_inputs: ['HMD']
 sparse_dim: 54
 input_motion_length: 40
 train_dataset_repeat_times: 10
